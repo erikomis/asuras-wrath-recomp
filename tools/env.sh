@@ -29,7 +29,7 @@ export ASURA_ANALYSIS=${ASURA_ANALYSIS:-$ASURA_ROOT/analysis/$ASURA_TITLE_ID}
 export ASURA_RECOMP=${ASURA_RECOMP:-$ASURA_ROOT/recompiled/$ASURA_TITLE_ID}
 export ASURA_BUILD=${ASURA_BUILD:-$ASURA_ROOT/build/$ASURA_TITLE_ID}
 export ASURA_ISO_DIR=${ASURA_ISO_DIR:-$ASURA_ROOT/game_iso}
-export ASURA_MOUNT=${ASURA_MOUNT:-/Volumes/ASURAS_WRATH}
+export ASURA_MOUNT=${ASURA_MOUNT:-$ASURA_ROOT/rpcs3/disc/ASURAS_WRATH}
 # Disc SELF (key_rev 0x0016, APP) and the update package's NPDRM SELF
 # (key_rev 0x0010): tools/fetch_keys.py writes every APP and NPDRM key from
 # RPCS3's published key_vault.cpp into the port's own user key file.

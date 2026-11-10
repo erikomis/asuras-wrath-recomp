@@ -141,3 +141,34 @@ final verdadeiro aparecer no menu, além do `.EDAT` ser decifrável.
 - [ ] `augment_functions.py` com TOC por porta no lifter do upstream.
 - [ ] O que mais o título pedir ao runtime (como no Afro: sys_mempool, JOBLIST
       do SPURS, etc.), cada correção genérica com um teste.
+
+## Diário do boot (10/11/2026)
+
+Cada um dos travamentos achado e corrigido, na ordem:
+
+1. **Tela preta total (boot1)**: o mount.sh linkou o disco do Afro Samurai
+   no VFS (o fallback aceitava qualquer /Volumes com PS3_GAME); o jogo leu
+   o PARAM.SFO do Afro, criou o cache fios como BLUS30264 e leu 0 bytes.
+   Fix: reuse do mount casa o image-path resolvido via hdiutil info.
+2. **Install 100%** (boot2): title id correto, ProgressBar 0→100, 1,2 GB de
+   CHARTEXTURES/LIGHTING/TEXTURES.TFC no hdd0 virtual, ContentPermit ok.
+3. **NIDs não resolvidos**: `_sys_spu_printf_initialize` (sysPrxForUser) e
+   `cellHttpInitCookie` — stubs adicionados ao toolkit.
+4. **User commands descartados (boot4/5/6)**: duas metades. (a) o
+   rsx_send_event lia o mask de handlers de g_gcm_driver_info_ea, que
+   nada jamais seta — jogos que registram via cellGcmSet*Handler tinham
+   tudo filtrado; o mask agora vem do g_gcm_handler_mask. (b) a fila do
+   ISR só nascia em sys_rsx_memory_allocate; o Asura inicializa via
+   _cellGcmInitBody (caminho SDK) e a fila ficava id 0 — tudo descartado.
+   rsx_isr_ensure_queue() no InitBody.
+
+Estado do boot: 18 threads do jogo, save criado, troféus init, flips
+~28/s, FIFO drena (get avança), PS3TOC.TXT e COALESCED_INT.BIN lidos —
+mas draws=0: frames vazios do UE3 (só semaphore + GET_REPORT + rebind de
+DMAs por frame, sem método de draw nenhum no histograma).
+
+**Bloqueio atual**: as duas tasks SPU do fios (tasksets 0x103ADB80 e
+0x10451100, image=2) estacionam em WAIT_SIGNAL com a LFQueue vazia — o
+produtor PPU nunca empurra trabalho. Suspeita: o scheduler do fios no PPU
+espera outra coisa primeiro. Ferramenta em mãos: SPURS_EF_SPU_REPLY
+(bisturi do toolkit: fabrica o flag de resposta e vê pra onde o PPU vai).

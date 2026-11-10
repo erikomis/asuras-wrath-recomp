@@ -49,7 +49,18 @@ feito.
       `mount.sh`, `lift_spu.sh`).
 - [x] `augment_functions.py` com o TOC detectável por porta (Afro
       0x8FFFE0, Asura 0x019AF8F8 — lido do OPD do entry).
-- [ ] EBOOT analisado e traduzido (em andamento).
+- [x] EBOOT analisado: **30.350 funções OPD**, entry 0x01994138 → código
+      0x00E05D5C, TOC 0x019AF8F8.
+- [x] **PPU traduzido** (`CHUNKS=24`): 66.996 funções emitidas, 18.690 alvos
+      de chamada únicos, 24 unidades de tradução.
+- [x] **SPU traduzido**: 27 imagens ELF embutidas no EBOOT extraídas e
+      liftadas (`port/spu/` + `spu_workloads.c` com registro por
+      construtor).
+- [x] O toolkit (worktree `../ps3recomp-asura`, v0.19.0 + patch de runtime do
+      Afro) **já descriptografa EDAT/SDAT em runtime** (`libs/filesystem/edat.c`,
+      com o klicensee que o título passa ao `sceNpDrmIsAvailable`): o
+      `PS3-BCGAME.INI.EDAT` da Part IV tem chance de abrir sem trabalho extra.
+- [ ] Compila e linka (próximo passo).
 
 A análise (`analysis/BLUS30721/EBOOT.*.json`): **30.350 funções** (2,4× o
 Afro Samurai), 292 imports de firmware de **21 bibliotecas** —
@@ -92,9 +103,11 @@ final verdadeiro aparecer no menu, além do `.EDAT` ser decifrável.
 
 ### 4. O final verdadeiro (Part IV: Nirvana)
 
-- [ ] `PS3-BCGAME.INI.EDAT` decifrado: o INI que diz ao jogo quais DLCs há,
-      cifrado no EDAT da Sony (licença livre). Decisão: decifrar no HLE do
-      `cellFs` como o RPCS3 (transparente ao jogo), um `.EDAT` por DLC.
+- [ ] `PS3-BCGAME.INI.EDAT` decifrado: **o toolkit v0.19 já faz isso em
+      runtime** (`libs/filesystem/edat.c`: NPDRM EDAT/SDAT, com o klicensee
+      que o título passa ao `sceNpDrmIsAvailable` — o UE3 da CC2 deve passar
+      o dele ao abrir o INI). Verificar na prática quando o boot chegar à
+      leitura de DLC; se falhar, é aqui.
 - [ ] Episódios 19-22 carregam e jogam (mapas `S19x`-`S22x_SF.XXX`).
 - [ ] Os interlúdios da Part IV (`INTERVALDRAMA_S2xx`) e as telas "to be
       continued" (`TOBECONTINUED_S2xx`).

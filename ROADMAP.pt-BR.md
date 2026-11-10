@@ -172,3 +172,34 @@ DMAs por frame, sem método de draw nenhum no histograma).
 produtor PPU nunca empurra trabalho. Suspeita: o scheduler do fios no PPU
 espera outra coisa primeiro. Ferramenta em mãos: SPURS_EF_SPU_REPLY
 (bisturi do toolkit: fabrica o flag de resposta e vê pra onde o PPU vai).
+
+### Investigação do bloqueio (fim do dia 10/11)
+
+- O loop de frames vazios é o UE3 rodando "nada": só SET_VIEWPORT
+  (0x0A20-0x0A3C), semáforos NV4097 (0x1D6C/0x1D70) e GET_REPORT por
+  frame — nenhum método de draw, nenhum bind de textura/shader.
+- O jogo NUNCA abriu nenhum .XXX de mapa nem .bik de vídeo. Só:
+  PS3TOC.TXT, COALESCED_INT.BIN (localização, ~1,2 MB lidos), cache
+  fios e ICON0 do save. Ele está preso ANTES do primeiro carregamento
+  de conteúdo.
+- As tasks SPU do fios (tasksets 0x103ADB80/0x10451100) dormem em
+  WAIT_SIGNAL com a LFQueue vazia: ninguém empurrou request de IO.
+  Os produtores seriam as threads "fios scheduler", que nascem, rodam
+  um job e saem (design efêmero do fios — elas são recriadas depois,
+  tids 11-13+; não é bug morrerem).
+- SPURS_EF_SPU_REPLY=2 (fabricar o flag de resposta) faz o PPU REBOOTAR
+  o boot inteiro (re-init de GCM/display buffers/SPURS): o flag não é
+  "ciclo completo", é sinal de reset — fabricá-lo não é o caminho.
+- O disco NÃO tem PS3-BCGAME.INI.EDAT (só a DLC Part IV tem); a config
+  do UE3 vem de ENGINE.XXX/GLOBALPERSISTENTCOOKERDATA.UPK, ainda não
+  lidos.
+
+**Próximas pistas (na ordem):**
+1. O spin de 30 us em 0x00CEE0BC lê o control register (put/get/ref)
+   via cellGcmGetControlRegister antes de cada tick — confirmar se ele
+   espera espaço no FIFO (put-get) ou ref; medir o que ele compara.
+2. Achar quem deveria emitir o primeiro request fios (função de
+   fios::ReadFile no PPU) e por que não chega: trace do caminho
+   0x00CEE0BC → o que o tick decide fazer depois do spin.
+3. Conferir se o cache.idx lido (512 bytes de header "fios") leva o
+   jogo a considerar o cache válido ou se ele esperava mais entradas.

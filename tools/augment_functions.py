@@ -29,22 +29,23 @@ import struct
 import sys
 
 def detect_toc(path):
-    """r2 from the ELF's entry OPD, as the SELF header reported it. PS3 app
-    ELFs are PIEs whose e_entry is 0; the loader's analysis json knows the
-    entry. Fall back to 0x8FFFE0 (Afro Samurai) when neither is available."""
+    """r2 from the ELF's entry OPD, as the loader's analysis json reports it
+    (EBOOT.loader.json: entry_opd as a hex string). Falls back to the disc's
+    first load segment scan for an OPD-looking entry, then 0x8FFFE0."""
     import glob
     cand = os.path.join(os.path.dirname(os.path.abspath(path)), '..', 'analysis')
     for j in glob.glob(cand + '/**/EBOOT.loader.json', recursive=True):
         try:
             meta = json.load(open(j))
-            for key in ('entry_opd', 'entry'):
-                v = meta.get(key) if isinstance(meta, dict) else None
-                if isinstance(v, int) and v > 0x10000:
-                    e = open(path, 'rb').read()
-                    if v + 8 <= len(e):
-                        toc = struct.unpack('>I', e[v+4:v+8])[0]
-                        if 0x10000 < toc < 0x10000000:
-                            return toc
+            v = meta.get('entry_opd') or meta.get('entry')
+            if isinstance(v, str):
+                v = int(v, 16)
+            if isinstance(v, int) and v > 0x10000:
+                e = open(path, 'rb').read()
+                if v + 8 <= len(e):
+                    toc = struct.unpack('>I', e[v+4:v+8])[0]
+                    if 0x10000 < toc < 0x10000000:
+                        return toc
         except Exception:
             pass
     return 0x8FFFE0

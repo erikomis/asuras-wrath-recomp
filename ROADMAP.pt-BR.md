@@ -46,6 +46,19 @@ feito.
       0x8FFFE0, Asura 0x019AF8F8 — lido do OPD do entry).
 - [ ] EBOOT analisado e traduzido (em andamento).
 
+A análise (`analysis/BLUS30721/EBOOT.*.json`): **30.350 funções** (2,4× o
+Afro Samurai), 292 imports de firmware de **21 bibliotecas** —
+`cellSpurs` (39), `cellSysutil` (35), `sysPrxForUser` (33), `cellGcmSys` (28),
+`sys_net` (21), `sys_fs` (19), `sceNp` (15), `sys_io` (14), `sceNpCommerce2`
+(14), `sceNpTrophy` (13), `cellResc` (11), `cellRtc` (8), `cellNetCtl` (7),
+`cellAudio` (7), `cellPngDec` (7), `cellGame` (6), `cellHttp` (6),
+`cellSysmodule` (3), `cellSsl` (3), `cellOvis` (2), `cellUserInfo` (1).
+
+Nota de DLC: `cellGame` + `sceNpCommerce2` + `sceNp` são o caminho pelo qual
+o jogo pergunta ao sistema quais episódios adicionais estão instalados — os
+stubs HLE dessas bibliotecas terão que responder "Part IV instalada" para o
+final verdadeiro aparecer no menu, além do `.EDAT` ser decifrável.
+
 ## Próximos passos
 
 ### 1. O executável

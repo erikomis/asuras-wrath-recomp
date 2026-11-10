@@ -60,7 +60,7 @@ feito.
       Afro) **já descriptografa EDAT/SDAT em runtime** (`libs/filesystem/edat.c`,
       com o klicensee que o título passa ao `sceNpDrmIsAvailable`): o
       `PS3-BCGAME.INI.EDAT` da Part IV tem chance de abrir sem trabalho extra.
-- [ ] Compila e linka (próximo passo).
+- [ ] Compila e linka (em andamento, sem erros até a etapa 169/225).
 
 A análise (`analysis/BLUS30721/EBOOT.*.json`): **30.350 funções** (2,4× o
 Afro Samurai), 292 imports de firmware de **21 bibliotecas** —

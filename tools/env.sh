@@ -1,10 +1,13 @@
 # Shared settings for the shell scripts in tools/. Sourced, not run (zsh).
 #
 #   ASURA_ROOT      this repository (default: the parent of tools/)
-#   PS3RECOMP_DIR   the toolkit checkout (default: ../ps3recomp-asura, a
-#                   worktree of ../ps3recomp-up-r9 on branch asura/r9-base;
-#                   title-specific fixes will be env-gated in port/main.cpp
-#                   and port/stubs.cpp, as in the Afro Samurai port)
+#   PS3RECOMP_DIR   the toolkit checkout (default: ../ps3recomp-asura: upstream
+#                  v0.19.0 ae92407b + the Afro Samurai port's runtime fixes
+#                  (patches/ps3recomp-ae92407b-afro.patch, all env-gated, so
+#                  they are safe for other titles), a worktree of
+#                  ../ps3recomp-up-r9 on branch asura/v0.19; title choices
+#                  stay env-gated in port/main.cpp and port/stubs.cpp, as in
+#                  the Afro Samurai port)
 #   ASURA_GAME      the game's files and the decrypted EBOOT (default:
 #                   $ASURA_ROOT/game): EBOOT.elf, EBOOT.BIN, PARAM.SFO
 #   ASURA_EBOOT     the decrypted PPU ELF the loader and lifter read

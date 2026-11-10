@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Rebuild the Asuras Wrath port: decrypt, analyse, lift, spu, build.
+# Rebuild the Asura's Wrath port: decrypt, analyse, lift, spu, build.
 #
 #   tools/rebuild.sh [step ...]
 #

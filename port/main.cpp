@@ -1,5 +1,7 @@
 /*
- * ps3recomp game project -- entry point template.
+ * Asura's Wrath (PS3, BLUS30721) -- ps3recomp runner. Based on the Afro
+ * Samurai port's runner (itself the PES 2013 port's, itself the toolkit
+ * template), with that port's title choices removed from asura_defaults().
  *
  * This is the runner. It boots a lifted title through the toolkit's PPU
  * scaffold: allocate the flat guest VM, load the PPU ELF named on the command
@@ -30,6 +32,9 @@
 
 /* The lifter's generated header, which declares ppu_context and the function
  * table. It comes first: everything below is written against that struct. */
+#include <algorithm>
+#include <pthread.h>
+#include <time.h>
 #include "ppu_recomp.h"
 
 /* The Win32 names -- Sleep, GetTickCount64, CreateThread, InterlockedIncrement,
@@ -48,8 +53,9 @@
 #endif
 
 #if defined(__APPLE__)
-#include <CoreFoundation/CoreFoundation.h>   /* the main thread's run loop, see run_guest */
 #include <pthread.h>
+#include <pthread/qos.h>
+#include <CoreFoundation/CoreFoundation.h>   /* the main thread's run loop */
 #endif
 
 #ifdef _WIN32
@@ -71,6 +77,12 @@ void     ppu_hle_init(void);                  /* firmware import NID -> HLE hand
 void     ppu_sysprx_register(void);           /* boot-critical CRT (sys_initialize_tls, ...) */
 void     ppu_fs_register(void);               /* cellFs over the real game directory */
 void     lv2_init_syscalls(void);             /* the lv2 syscall table */
+
+/* libs/system/cellGame.c: title id / category / version out of PARAM.SFO.
+ * Without it cellGame answers cellGameBootCheck with the placeholder
+ * 'BLES00000', and every /dev_hdd0/game/<title>_INSTALL path the title builds
+ * from that id names a directory that cannot exist. */
+void     cellGame_init_from_paramsfo(const char* sfo_path);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 
 /* This project's own: load whatever real system PRX modules the title needs
@@ -79,12 +91,6 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
 void     ps3_load_prx_modules(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
-void     ps3_host_quit(const char* why);      /* cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
-
-/* sys_ppu_thread.c: the main thread's stack, as sys_ppu_thread_get_stack_information
- * reports it. Left at 0 it names VM_STACK_BASE, the first created thread's stack. */
-extern uint32_t g_ppu_main_stack_addr;
-extern uint32_t g_ppu_main_stack_size;
 
 /* The status the guest handed to sys_process_exit. A title that exits that way
  * never returns through ppu_run, so this is only read on the path where the
@@ -154,7 +160,6 @@ extern "C" int  rsx_null_backend_pump_messages(void);
  * smaller arena makes every spawned thread's stack access out of bounds. */
 #define VM_SIZE       0x100010000ull   /* the full 32-bit guest space + a 64K guard */
 #define STACK_TOP     0x0FF00000u      /* main-thread stack, below the 0x10000000 segment */
-#define STACK_SIZE    0x00100000u      /* what the main thread is told it has */
 #define WINDOW_WIDTH  1280
 #define WINDOW_HEIGHT 720
 
@@ -181,12 +186,81 @@ extern "C" unsigned ppu_boot_frames_presented(void)
     return (unsigned)g_frames_presented;
 }
 
+/* Monotonic microseconds. GetTickCount64 has only 1 ms steps, too coarse to pace a
+ * 16.683 ms vblank or to see a frame that came 3 ms late. */
+static unsigned long long mono_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)ts.tv_nsec / 1000u;
+}
+
+/* RSX_PACE_LOG=<seconds>: frame pacing, which an average frame rate hides. Each line
+ * has the time between presents (median, 95th and 99th percentile, worst), how many
+ * were late against 60 Hz (> 20 ms) and against 30 Hz (> 37 ms), and the worst time
+ * the present call itself blocked this thread, which also drains the FIFO. */
+static void pace_note(unsigned long long t0, unsigned long long t1)
+{
+    enum { CAP = 4096 };
+    static long secs = -1;
+    static unsigned iv[CAP];
+    static unsigned n, worst_present;
+    static unsigned long long last, window_start;
+    if (secs < 0) { const char* e = getenv("RSX_PACE_LOG"); secs = e ? atol(e) : 0; }
+    if (!secs) return;
+    if (last && n < CAP) iv[n++] = (unsigned)(t1 - last);
+    last = t1;
+    if (t1 - t0 > worst_present) worst_present = (unsigned)(t1 - t0);
+    if (!window_start) window_start = t1;
+    if (t1 - window_start < (unsigned long long)secs * 1000000ull || !n) return;
+    std::sort(iv, iv + n);
+    unsigned late60 = 0, late30 = 0;
+    for (unsigned i = 0; i < n; i++) { late60 += iv[i] > 20000u; late30 += iv[i] > 37000u; }
+    fprintf(stderr, "[pace] %.1f fps | p50 %.1f p95 %.1f p99 %.1f max %.1f ms | >20ms %u >37ms %u | present max %.1f ms\n",
+            n * 1000000.0 / (double)(t1 - window_start), iv[n / 2] / 1000.0, iv[n * 95 / 100] / 1000.0,
+            iv[n * 99 / 100] / 1000.0, iv[n - 1] / 1000.0, late60, late30, worst_present / 1000.0);
+    n = 0; worst_present = 0; window_start = t1;
+}
+
 static void present_guest_frame(void)
 {
+    const unsigned long long t0 = mono_us();
     rsx_backend_present();
+    pace_note(t0, mono_us());
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
+}
+
+/* The frame clock sleeps on this between passes; an SPU storing the RSX `put` rings
+ * it (g_gcm_put_doorbell) so the drain runs within microseconds of the move instead
+ * of up to a pass later. Everything still runs on this thread. */
+/* Weak: the r8 toolkit rings it from SPU stores of `put`; upstream v0.19 has
+ * no doorbell, and then the clock just keeps its fixed cadence. */
+extern "C" { __attribute__((weak)) void (*g_gcm_put_doorbell)(void) = nullptr; }
+static pthread_mutex_t s_db_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  s_db_cv  = PTHREAD_COND_INITIALIZER;
+static int s_db_rung = 0;
+static void put_doorbell(void)
+{
+    pthread_mutex_lock(&s_db_mtx);
+    s_db_rung = 1;
+    pthread_cond_signal(&s_db_cv);
+    pthread_mutex_unlock(&s_db_mtx);
+}
+static void frame_clock_wait(int us)
+{
+    pthread_mutex_lock(&s_db_mtx);
+    if (!s_db_rung) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += (long)us * 1000;
+        ts.tv_sec += ts.tv_nsec / 1000000000L;
+        ts.tv_nsec %= 1000000000L;
+        pthread_cond_timedwait(&s_db_cv, &s_db_mtx, &ts);
+    }
+    s_db_rung = 0;
+    pthread_mutex_unlock(&s_db_mtx);
 }
 
 static DWORD WINAPI frame_clock(LPVOID)
@@ -198,12 +272,22 @@ static DWORD WINAPI frame_clock(LPVOID)
     fprintf(stderr, "[rsx] %s backend init %s\n", RSX_BACKEND_NAME,
             rsx_ok ? "OK -- window open" : "FAILED");
 
-    unsigned  last_flip = 0;
-    ULONGLONG next_tick = GetTickCount64();
+    /* PS3_FRAMECLOCK_US: the sleep between passes. The title fences every render pass
+     * on a label the drain writes, and it moves `put` from the PPU too, which rings no
+     * doorbell, so this is added to each of those waits. A pass with nothing to do is
+     * cheap. */
+    int clock_us = 1000;
+    { const char* e = getenv("PS3_FRAMECLOCK_US"); if (e && atoi(e) > 0) clock_us = atoi(e); }
+    /* PS3_VBLANK_US: 59.94 Hz, as the console and a 60 Hz display. The whole 16 ms this
+     * used to be is 62.5 Hz, which runs the title 4% fast and drifts against the display:
+     * a repeated or dropped frame about every half second. */
+    unsigned long long vblank_us = 16683;
+    { const char* e = getenv("PS3_VBLANK_US"); if (e && atoi(e) > 0) vblank_us = (unsigned)atoi(e); }
+    unsigned long long next_tick = mono_us(), last_pump = 0;
 
     for (;;) {
-        Sleep(4);
-        ULONGLONG now = GetTickCount64();
+        frame_clock_wait(clock_us);
+        const unsigned long long now = mono_us();
 
         int fired = 0;
         while ((long long)(now - next_tick) >= 0 && fired < 240) {
@@ -214,47 +298,55 @@ static DWORD WINAPI frame_clock(LPVOID)
              * batch held right now is exactly the completed frame; presenting
              * after the drain races the guest's next-frame writes and shows a
              * mixed one. */
-            if (rsx_ok && cellGcm_take_flip_pending()) {
+            if (rsx_ok && cellGcm_take_flip_pending())
                 present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
-            }
             /* Drain the FIFO every tick. This is what writes the RSX sync-fence
              * labels the game's per-frame logic blocks on, so it has to keep
              * advancing at 60 Hz even while present() throttles. */
             if (rsx_ok) cellGcm_rsx_process_fifo();
-            next_tick += 16;             /* ~60 Hz */
+            next_tick += vblank_us;
             fired++;
         }
         if (fired >= 240) next_tick = now;   /* fell too far behind -- resync */
 
-        /* Drain at the outer cadence too, not only on the 16 ms tick: titles
-         * fence every render pass on a label the drain writes, and one wave of
-         * those at 16 ms apiece paces the guest into single-figure frame rates.
-         * The real RSX writes them in microseconds. */
+        /* Drain at the outer cadence too, not only on the tick: titles fence every
+         * render pass on a label the drain writes, and one wave of those at 16 ms
+         * apiece paces the guest into single-figure frame rates. The real RSX writes
+         * them in microseconds. */
         if (rsx_ok) {
-            if (cellGcm_take_flip_pending()) {
+            if (cellGcm_take_flip_pending())
                 present_guest_frame();
-                last_flip = cellGcm_flip_request_count();
-            }
             cellGcm_rsx_process_fifo();
 
-            if (rsx_backend_pump() != 0) {
-                rsx_ok = 0;              /* window closed */
-                /* ...so quit, as the console's Quit Game does, instead of
-                 * leaving the game running with no window. */
-                ps3_host_quit("window closed");
-                continue;
+            /* Window events at most every 4 ms: a windowed pump is a dispatch_sync to
+             * the main thread, and this loop runs far more often than that. */
+            const int pump_due = now - last_pump >= 4000;
+            if (pump_due) {
+                last_pump = now;
+                if (rsx_backend_pump() != 0) {
+                    rsx_ok = 0;              /* window closed */
+                    continue;
+                }
             }
-            /* Present on a guest flip. A present on a fixed clock can catch the
-             * drain mid-frame and flash a partial one. Before the first flip
-             * present freely, so the window is not blank during boot. */
-            unsigned fc = cellGcm_flip_request_count();
-            if (fc != last_flip) {
+            /* Present a flip the drain just reached. Before the first flip present
+             * at the pump's cadence, so the window is not blank during boot.
+             *
+             * Also present when the flip request count moved (the v0.19 template
+             * does the same): upstream's call-time cellGcmSetPrepareFlip counts
+             * the flip without raising the pending flag, so with only the flag
+             * this title flipped 600 times a second and nothing reached the
+             * screen. At most one present per vblank, so the window paces. */
+            static unsigned last_fc = 0;
+            static unsigned long long last_fc_present = 0;
+            const unsigned fc = cellGcm_flip_request_count();
+            if (cellGcm_take_flip_pending()) {
                 present_guest_frame();
-                last_flip = fc;
-            } else if (fc == 0) {
+                last_fc = fc; last_fc_present = now;
+            } else if (fc != last_fc && now - last_fc_present >= vblank_us) {
+                present_guest_frame();
+                last_fc = fc; last_fc_present = now;
+            } else if (pump_due && fc == 0)
                 rsx_backend_present();
-            }
         }
     }
     return 0;
@@ -312,28 +404,71 @@ static bool alloc_guest_vm(void)
 #else
     /* No vectored exception handlers off Windows, so the arena is mapped up
      * front and lazily backed by the OS: only pages the title touches cost
-     * anything. It spans the whole 32-bit space plus the guard, as on Windows.
-     * It used to stop below 0xE0000000, but the raw SPU windows (local store
-     * and problem-state registers, runtime/spu/spu_raw.c) live from there up.
-     * Every load and store a title made into one was reported as an
-     * out-of-bounds access and dropped, so a raw SPU was never loaded or
-     * started, and sys_raw_spu_create, which clears the registers through
-     * vm_base directly, wrote past the end of the mapping. With the whole
-     * space backed, ppu_vm_size 0 also gives the loader's bounds check the
-     * one-compare fast path Windows already has.
+     * anything. It stops below the 0xE0000000 mark, so ppu_vm_size arms the
+     * loader's bounds check for what is left.
      *
      * mmap, not calloc: vm_commit() hands vm_base + addr to mprotect, which
      * takes page-aligned addresses only. glibc serves an allocation this big
      * from its own mmap chunk and returns a pointer 16 bytes past the page
      * start, so every commit failed with EINVAL and sys_memory_allocate
      * answered ENOMEM to every call. mmap's base is page-aligned and zeroed. */
-    void* p = mmap(NULL, VM_SIZE, PROT_READ | PROT_WRITE,
+    void* p = mmap(NULL, 0xE0000000u, PROT_READ | PROT_WRITE,
                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     vm_base = (p == MAP_FAILED) ? nullptr : (uint8_t*)p;
-    ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
+    ppu_vm_size = 0xE0000000u;
 #endif
     return vm_base != nullptr;
 }
+
+/* ASURA_TEXT_RO=1 (diagnostic): make the guest's text segment read-only once
+ * the loader and HLE setup are done. Lifted code never reads instructions,
+ * but switch tables live inline in .text, and some of them read back zero
+ * mid-game ("unresolved indirect call" to a table base) while PPU_WWATCH sees
+ * no guest store. A host write (HLE memcpy, SPU DMA, file read) then faults
+ * here with a host backtrace and the guest caller. */
+#if !defined(_WIN32)
+#include <execinfo.h>
+#include <signal.h>
+extern "C" void ppu_guest_caller(char* out, size_t n);
+static uintptr_t s_ro_lo, s_ro_hi;
+static struct sigaction s_ro_prev_bus, s_ro_prev_segv;
+static void text_ro_fault(int sig, siginfo_t* si, void* uc)
+{
+    uintptr_t a = (uintptr_t)si->si_addr;
+    if (a >= s_ro_lo && a < s_ro_hi) {
+        char who[128]; ppu_guest_caller(who, sizeof who);
+        fprintf(stderr, "\n[text-ro] WRITE to guest 0x%08X (text) guest caller: %s\n",
+                (unsigned)(a - (uintptr_t)vm_base), who);
+        void* bt[48]; int n = backtrace(bt, 48);
+        backtrace_symbols_fd(bt, n, 2);
+        fflush(stderr);
+        if (getenv("ASURA_TEXT_RO_CONT")) {   /* report each writer once, keep going */
+            mprotect((void*)s_ro_lo, s_ro_hi - s_ro_lo, PROT_READ | PROT_WRITE);
+            return;
+        }
+        abort();
+    }
+    const struct sigaction& p = sig == SIGBUS ? s_ro_prev_bus : s_ro_prev_segv;
+    if ((p.sa_flags & SA_SIGINFO) && p.sa_sigaction) { p.sa_sigaction(sig, si, uc); return; }
+    signal(sig, SIG_DFL);
+}
+static void text_ro_arm(void)
+{
+    const char* e = getenv("ASURA_TEXT_RO");
+    if (!e || *e != '1') return;
+    s_ro_lo = (uintptr_t)vm_base + 0x10000u;
+    s_ro_hi = ((uintptr_t)vm_base + 0x10000u + 0x88DBC8u) & ~(uintptr_t)0x3FFF;
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = text_ro_fault; sa.sa_flags = SA_SIGINFO; sigemptyset(&sa.sa_mask);
+    sigaction(SIGBUS, &sa, &s_ro_prev_bus);
+    sigaction(SIGSEGV, &sa, &s_ro_prev_segv);
+    int rc = mprotect((void*)s_ro_lo, s_ro_hi - s_ro_lo, PROT_READ);
+    fprintf(stderr, "[text-ro] guest 0x10000..0x%08X read-only (rc=%d)\n",
+            (unsigned)(s_ro_hi - (uintptr_t)vm_base), rc);
+}
+#else
+static void text_ro_arm(void) {}
+#endif
 
 /* ---------------------------------------------------------------------------
  * Main
@@ -345,57 +480,58 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
     ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
-/* ---------------------------------------------------------------------------
- * Running the guest
- * -----------------------------------------------------------------------*/
-#if defined(__APPLE__)
-/* AppKit only runs on the process's main thread. The Metal backend creates
- * its window and pumps its events with dispatch_sync onto the main queue
- * when it is called from any other thread, as it is from the frame clock.
- * With the guest on the main thread nothing ever serviced that queue: the
- * frame clock blocked in its first rsx_backend_init, no vblank or flip was
- * ever delivered and the FIFO never drained. A title that waits for a flip
- * hangs there. So the guest runs on a thread of its own, with the same
- * 256 MB host stack every guest thread gets (sys_ppu_thread.c), and the
- * main thread turns the run loop until ppu_run returns. Headless runs never
- * touch the main queue, which is why CI does not see the difference. */
-struct guest_run { uint32_t entry, stack_top; int rc; volatile int done; };
-
-static void* guest_thread(void* arg)
+/* Asura's Wrath's choices among the toolkit's env-gated behaviours. Set before
+ * anything reads them; an explicit value in the environment still wins.
+ *
+ * The toolkit (../ps3recomp-asura, upstream v0.19.0 + the Afro Samurai port's
+ * runtime patch) already keeps the command buffer's last word for the wrap
+ * JUMP (#648) and reports 249 MB of VRAM (#660), both of which this engine
+ * family needs. */
+static void asura_defaults(void)
 {
-    guest_run* g = (guest_run*)arg;
-    g->rc = ppu_run(g->entry, g->stack_top);
-    __atomic_store_n(&g->done, 1, __ATOMIC_RELEASE);
-    CFRunLoopStop(CFRunLoopGetMain());
-    return nullptr;
-}
+    /* Title choices for Asura's Wrath (BLUS30721, UE3 "BCGAME"). Each one is
+     * a starting default from what the same engine family needed in the
+     * author's earlier ports (Deadpool, Afro Samurai -- both UE3-era, SPURS
+     * heavy); revisit each when this title boots. setenv(..., 0) never
+     * overrides a variable that is already set, so any experiment is
+     * VAR=... tools/run.sh away. */
+    /* PS3_MMAPPER_TRACK    real map/unmap/free bookkeeping. UE3 titles create
+     *     and destroy 256 KB mempools constantly and place their own heap
+     *     pages with map_memory; the untracked cursor overlapped the two in
+     *     the Afro port and the title abort()ed. */
+    setenv("PS3_MMAPPER_TRACK", "1", 0);
+    /* PS3_MAPPER_WIDE      room for large ascending address reservations;
+     *     Afro's six (512 MB + 5 x 256 MB) came back ENOMEM otherwise. */
+    setenv("PS3_MAPPER_WIDE", "1", 0);
+    /* SPU_INTERP_UNLIFTED  run SPU code that has no lifted body interpreted
+     *     (Deadpool and Afro both needed it; UE3 titles overlay SPU modules).
+     *     Revisit once this port's own SPU images are lifted. */
+    setenv("SPU_INTERP_UNLIFTED", "1", 0);
 
-static int run_guest(uint32_t entry, uint32_t stack_top)
-{
-    static guest_run g;
-    g.entry = entry; g.stack_top = stack_top; g.rc = 0; g.done = 0;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
-    pthread_t th;
-    int err = pthread_create(&th, &attr, guest_thread, &g);
-    pthread_attr_destroy(&attr);
-    if (err != 0) {
-        fprintf(stderr, "[boot] could not start the guest thread (%d)\n", err);
-        return -1;
-    }
-    /* Short slices: CFRunLoopStop only ends a run that is already going. */
-    while (!__atomic_load_n(&g.done, __ATOMIC_ACQUIRE))
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
-    pthread_join(th, nullptr);
-    return g.rc;
+    /* Not enabled for this title yet (the Afro Samurai port's choices,
+     * kept here as the reference list of what to reach for when the boot
+     * hangs the way they fixed -- see that port's main.cpp for the full
+     * story of each):
+     *   SAVEDATA_CBRESULT_STRICT  stat callback ERR_NODATA -> ERROR_CBRESULT
+     *   SPURS_JG_WAIT_FOREVER     job chains that sit on their guard
+     *   SPURS_JC_EVENT_FROM_JOB   one event per lap from the last job
+     *   SPURS_JOB_CTX_V1          older job-context field layout
+     *   GCM_PREPAREFLIP_FIFO=2 + GCM_FLIPCB_ONTICK=1 + GCM_SEMA_ACQUIRE=1
+     *                            the prepare-flip/immediate-flip 30 fps pacing
+     */
 }
-#else
-static int run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
-#endif
 
 int main(int argc, char** argv)
 {
+    asura_defaults();
+#ifdef __APPLE__
+    /* A game, not background work: new threads inherit this. By default macOS lets a
+     * thread that is not saturating a core drift to the efficiency cores and low clocks,
+     * which here took one frame's RSX work from about 10 ms to about 24 ms, and the frame
+     * from 60 fps to 30. PS3_QOS=0 leaves the default. */
+    if (!getenv("PS3_QOS") || getenv("PS3_QOS")[0] != '0')
+        pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
     if (argc < 2) {
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;
@@ -426,27 +562,80 @@ int main(int argc, char** argv)
     derive_vfs_root(argv[1]);
     printf("[boot] VFS root: %s\n", ppu_vfs_root);
 
+    /* Tell cellGame who we are before the guest can ask. Two candidates: the
+     * disc's own copy under the mounted image, then the one staged beside the
+     * ELF. A title that builds "/dev_hdd0/game/<id>..." paths from the id it
+     * reads back out of cellGameBootCheck goes looking for a directory that
+     * can never be there when that id is the placeholder. */
+    {
+        static const char* const cand[] = { "/PS3_GAME/PARAM.SFO", "/game/PARAM.SFO" };
+        char sfo[1024];
+        for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++) {
+            snprintf(sfo, sizeof sfo, "%s%s", ppu_vfs_root, cand[i]);
+            FILE* f = fopen(sfo, "rb");
+            if (!f) continue;
+            fclose(f);
+            cellGame_init_from_paramsfo(sfo);
+            break;
+        }
+    }
+
     ppu_recomp_register();   /* lifted function table -> address map */
     ps3_load_prx_modules();  /* this game's lifted system PRX, if it has any */
     ppu_hle_init();          /* firmware import NID -> HLE handlers */
     ppu_sysprx_register();   /* boot-critical CRT */
     ppu_fs_register();       /* cellFs over the game directory */
     lv2_init_syscalls();     /* the lv2 syscall table */
+    text_ro_arm();           /* ASURA_TEXT_RO=1 diagnostic */
 
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
+    if (!getenv("GCM_PUT_DOORBELL") || getenv("GCM_PUT_DOORBELL")[0] != '0')
+        g_gcm_put_doorbell = put_doorbell;
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",
            entry, STACK_TOP);
 
-    /* A title that reads its own stack bounds (to find data its parent left
-     * below the top, say) gets the stack it really runs on. */
-    g_ppu_main_stack_addr = STACK_TOP - STACK_SIZE;
-    g_ppu_main_stack_size = STACK_SIZE;
-
-    int rc = run_guest(entry, STACK_TOP);
+    int rc;
+#if defined(__APPLE__)
+    /* The Metal backend pumps the window's events with dispatch_sync onto the
+     * main queue. With the guest on the main thread nothing ever services
+     * that queue, so the frame clock blocks in its first event pump, the FIFO
+     * never drains, and the guest spins for ever waiting for get to reach its
+     * put (the first boot died exactly there: "GCM control spin", get stuck
+     * at 0). The guest runs on its own thread instead (256 MB host stack,
+     * like every other guest thread) and the main thread turns the run loop.
+     * Same fix as the Deadpool, Resistance 2 and inFAMOUS 2 ports. */
+    {
+        struct boot_args { uint32_t entry; uint32_t stack_top; int rc; volatile int done; };
+        static boot_args ba;
+        ba.entry = entry; ba.stack_top = STACK_TOP; ba.rc = 0; ba.done = 0;
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
+        pthread_t th;
+        auto body = [](void* a) -> void* {
+            boot_args* b = (boot_args*)a;
+            b->rc = ppu_run(b->entry, b->stack_top);
+            __atomic_store_n(&b->done, 1, __ATOMIC_RELEASE);
+            CFRunLoopStop(CFRunLoopGetMain());
+            return nullptr;
+        };
+        if (pthread_create(&th, &attr, body, &ba) != 0) {
+            fprintf(stderr, "[boot] could not start the guest thread\n");
+            return 1;
+        }
+        pthread_attr_destroy(&attr);
+        while (!__atomic_load_n(&ba.done, __ATOMIC_ACQUIRE))
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+        pthread_join(th, nullptr);
+        rc = ba.rc;
+    }
+#else
+    rc = ppu_run(entry, STACK_TOP);
+#endif
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
 
     /* A title that called sys_process_exit never reaches this line: that path

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Lift the SPU images embedded in the Asuras Wrath EBOOT and register them for
+# Lift the SPU images embedded in the Asura's Wrath EBOOT and register them for
 # the SPURS/workload dispatch (port/spu/spu_workloads.c).
 #
 #   tools/lift_spu.sh
@@ -8,9 +8,10 @@
 # analysis/BLUS30721/spu/ (rebuild.sh spu). Their file bytes are what the
 # runtime fingerprints at dispatch time, so the content fingerprints match.
 #
-#   spu_0000  EDGE ZLIB inflate task (SPURS task; package decompression)
-#   spu_0001  FMOD Ex SPURS mixer (fmodex_spurs.elf)
-#   0002-0019 FMOD codec and DSP plugins (adpcm, mpeg, chorus, echo, reverb...)
+# What the Asura's Wrath EBOOT embeds is not catalogued yet (run
+# tools/rebuild.sh spu and read the names in analysis/BLUS30721/spu/; UE3
+# titles typically carry their own SPURS modules). This script is engine
+# agnostic: it lifts every image it finds.
 #
 # Images whose executable segment carries a data tail get --code-end (end of
 # the last real function), set in SPU_CODE_END below when one is found.
@@ -28,20 +29,17 @@ KIT="$PS3RECOMP_DIR/tools"
 typeset -A SPU_CODE_END
 # SPU_CODE_END[spu_00NN]=0x....
 
-# Extra lifter options per image.
-#   spu_0001  FMOD's mixer calls the DSP/codec plugins it overlays into local
-#             store (interpreted: SPU_INTERP_UNLIFTED) with bisl, and a plugin
-#             returns into the MIDDLE of a mixer function. With no lifted entry
-#             there, the return resumed at the next entry down (0x17718 ->
-#             0x17860), ran the wrong code into a garbage lr, and the mixer job
-#             ended -- the first menu sound then froze the game on FMOD's flags.
-#             --return-entries makes every call's return address an entry;
-#             --merge-chunks keeps straight-line code in one function.
+# Extra lifter options per image. Empty for now; add entries as this title's
+# images turn out to need them. The Afro Samurai port's FMOD mixer needed
+# "--return-entries --merge-chunks" (a plugin returned into the middle of a
+# mixer function and the dispatch resumed at the wrong entry); if an Asura's
+# Wrath image shows a similar resume-in-the-middle bug, reach for those.
 typeset -A SPU_EXTRA
-SPU_EXTRA[spu_0001]="--return-entries --merge-chunks"
 
 mkdir -p "$SPU"
-for elf in "$IMG"/spu_*.elf; do
+found=0
+for elf in "$IMG"/spu_*.elf(N); do
+    found=$(( found + 1 ))
     stem=${elf:t:r}
     [[ -n "${ONLY_SPU:-}" && "${stem%%_at_*}" != "$ONLY_SPU" ]] && continue
     ce=${SPU_CODE_END[${stem%%_at_*}]}
@@ -55,6 +53,11 @@ for elf in "$IMG"/spu_*.elf; do
     "${cmd[@]}" > "$ASURA_ROOT/cache/lift_spu_${stem}.log" 2>&1 || {
         echo "  FAILED, see cache/lift_spu_${stem}.log" >&2; exit 1; }
 done
+
+if [ "$found" -eq 0 ]; then
+    echo "[lift_spu] no SPU images in $IMG (nothing embedded in the EBOOT?)"
+    exit 0
+fi
 
 "$PY" "$KIT/build_spu_workloads.py" --images "$IMG" \
     --lifted "$SPU" --out "$SPU/spu_workloads.c" --constructor --skip-lift

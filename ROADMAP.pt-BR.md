@@ -17,8 +17,13 @@ feito.
   verdadeiro** —, os Lost Episodes (crossover com Street Fighter) e o patch.
   Falta o jogo rodar até elas (e o `.EDAT` de configuração, abaixo).
 - **Toolkit:** ps3recomp (worktree `../ps3recomp-asura`, branch
-  `asura/r9-base`, a partir do r9 upstream). Correções do título serão
-  controladas por variável de ambiente, como no port do Afro Samurai.
+  `asura/v0.19`): upstream v0.19.0 (`ae92407b`) **+ o patch de runtime do port
+  do Afro Samurai** (`patches/ps3recomp-ae92407b-afro.patch` do repositório
+  dele), que aplicou limpo — as correções dele (SPURS JOBLIST, ids reais do
+  prepare-flip, mapeador de memória com controle, sys_mempool...) são
+  genéricas e env-gated. O Asura é UE3/SPURS pesado como o Afro; a expectativa
+  é que precise das mesmas coisas. Correções novas do título continuarão
+  env-gated em port/main.cpp e port/stubs.cpp.
 
 ## Feito
 

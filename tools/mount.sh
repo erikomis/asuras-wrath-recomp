@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Mount the Asuras Wrath disc image read-only at $ASURA_MOUNT if it is not
+# Mount the Asura's Wrath disc image read-only at $ASURA_MOUNT if it is not
 # mounted yet. The ISO is never written to.
 set -e
 source "${0:A:h}/env.sh"

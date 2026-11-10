@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Run the recompiled Asuras Wrath build. Extra arguments are passed through as
+# Run the recompiled Asura's Wrath build. Extra arguments are passed through as
 # VAR=value environment overrides, e.g.  tools/run.sh PS3_FSLOG=1
 #
 # A disc title: the ISO is mounted read-only (tools/mount.sh) and its
@@ -38,7 +38,7 @@ mkdir -p "$RSX_MSL_CACHE"
 # Firmware tree, read-only: FMOD may load its MP3 codec from /dev_flash.
 [ -d "$HOME/Library/Application Support/rpcs3/dev_flash" ] && \
     export PS3_DEV_FLASH="${PS3_DEV_FLASH:-$HOME/Library/Application Support/rpcs3/dev_flash}"
-export PS3_TITLE=${PS3_TITLE:-"Asuras Wrath"}
+export PS3_TITLE=${PS3_TITLE:-"Asura's Wrath"}
 # A redirected stderr means verbose by default (runtime/ps3_log.h); keep it quiet
 # unless asked: PS3_VERBOSE=1.
 export PS3_VERBOSE=${PS3_VERBOSE:-0}

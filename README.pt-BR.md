@@ -77,9 +77,11 @@ docs/          DLC.md e outros
 - [x] As DLCs baixadas da CDN da Sony e desempacotadas: **Part IV: Nirvana
       (final verdadeiro)**, Lost Episodes 1 e 2 (crossover Street Fighter),
       patch 1.02. Linkadas no VFS no layout que o instalador da Sony usa.
-- [ ] PPU analisado e traduzido (em andamento).
-- [ ] SPU extraído e traduzido.
-- [ ] Compila e roda no macOS/arm64 com Metal.
+- [x] PPU analisado e traduzido.
+- [x] 27 imagens SPU extraídas e traduzidas; um job Edge Geometry adicional registrado.
+- [x] Compila e inicia no macOS/arm64 com Metal (Apple M4 Pro).
+- [x] Vídeos de carregamento e logotipos renderizados em Metal.
+- [ ] Execução estável até o menu e partida; investigação em andamento.
 - [ ] Boot → menus → gameplay.
 
 Veja o [ROADMAP.pt-BR.md](ROADMAP.pt-BR.md).

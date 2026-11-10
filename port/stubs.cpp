@@ -12,6 +12,70 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
+#include "ppu_recomp.h"
+
+extern "C" void ppu_register_function(uint64_t, void (*)(ppu_context*));
+extern "C" void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*));
+extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
+extern "C" void asura_spurs_queue_pop(ppu_context*);
+extern "C" void asura_spurs_queue_push(ppu_context*);
+void func_000F3BE0(ppu_context*);
+
+/* UE3's fatal-error Serialize implementation is reached through a vtable.
+ * Mirror its UTF-16BE message before the original enters error handling;
+ * otherwise the release build can leave only a black screen in the host log.
+ * This hook observes the message and preserves the guest's error path. */
+static void asura_error_serialize(ppu_context* ctx)
+{
+    const uint32_t address = (uint32_t)ctx->gpr[4];
+    char message[4096];
+    size_t n = 0;
+    for (uint32_t i = 0; address && i < 1024; ++i) {
+        const uint64_t ea = (uint64_t)address + i * 2;
+        if (ea + 1 > UINT32_MAX) break;
+        const uint32_t c = vm_read16((uint32_t)ea);
+        if (!c) break;
+        if (c < 0x80) message[n++] = (char)c;
+        else if (c < 0x800) {
+            message[n++] = (char)(0xC0 | (c >> 6));
+            message[n++] = (char)(0x80 | (c & 63));
+        } else {
+            message[n++] = (char)(0xE0 | (c >> 12));
+            message[n++] = (char)(0x80 | ((c >> 6) & 63));
+            message[n++] = (char)(0x80 | (c & 63));
+        }
+    }
+    message[n] = 0;
+    fprintf(stderr, "[asura error] lr=0x%08X category=0x%X: %s\n",
+            (uint32_t)ctx->lr, (uint32_t)ctx->gpr[5], message);
+    ppu_dump_guest_stack(ctx, "asura-error");
+    func_000F3BE0(ctx);
+}
+
+/* The SDK stub declares GetOverlayTableSize(path, size_out), but this title
+ * passes one in-memory SPU ELF and uses the RETURN VALUE as the byte count.
+ * Its NOT_INITIALIZED error becomes a 0x80410785-byte allocation. Match the
+ * current RPCS3 fallback (no overlay table) for these two imports until the
+ * runtime implements SPU overlay tables. This does not implement overlays.
+ * Reference: RPCS3/rpcs3, Emu/Cell/Modules/cellOvis.cpp. */
+static void asura_ovis_no_table(ppu_context* ctx)
+{
+    fprintf(stderr, "[asura ovis] no overlay table, arg=0x%08X lr=0x%08X\n",
+            (uint32_t)ctx->gpr[3], (uint32_t)ctx->lr);
+    ctx->gpr[3] = 0;
+}
+
+extern "C" void ps3_install_title_hooks(void)
+{
+    ps3_hle_register_ctx(0x91066667, "cellSpursQueuePopBody", asura_spurs_queue_pop);
+    ps3_hle_register_ctx(0x92CFF6ED, "cellSpursQueuePushBody", asura_spurs_queue_push);
+    const char* e = getenv("ASURA_OVIS_COMPAT");
+    if (!e || e[0] != '0') {
+        ps3_hle_register_ctx(0x82F294B2, "cellOvisGetOverlayTableSize", asura_ovis_no_table);
+        ps3_hle_register_ctx(0xA876C911, "cellOvisInitializeOverlayTable", asura_ovis_no_table);
+    }
+}
 
 #include "ps3emu/ps3types.h"
 #include "ps3emu/error_codes.h"
@@ -28,6 +92,8 @@
 
 extern "C" void ps3_load_prx_modules(void)
 {
+    if (const char* e = getenv("ASURA_GUEST_LOG"); e && e[0] == '1')
+        ppu_register_function(0x000F3BE0, asura_error_serialize);
 }
 
 /* ---------------------------------------------------------------------------

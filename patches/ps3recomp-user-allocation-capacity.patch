@@ -1,0 +1,92 @@
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index 4205f776..24f271f3 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -78,28 +78,40 @@ static void write_be32(uint32_t addr, uint32_t val)
+  * The small runtime-injected window is reserved even when a port relocates it
+  * into this domain, and loaded ELF data/BSS remain owned by the image.
+  * Use 64-bit arithmetic for every exclusive range end. */
++typedef struct user_range { uint64_t start, end; } user_range;
++static int user_range_compare(const void* lhs, const void* rhs)
++{
++    const user_range* a = lhs; const user_range* b = rhs;
++    return (a->start > b->start) - (a->start < b->start);
++}
+ static uint32_t user_address(uint32_t size, uint32_t alignment)
+ {
++    /* Sort once and scan once. Restarting a full table scan after every live
++     * page made many 64 KiB allocations cubic in the number of pages. */
++    user_range ranges[SYS_MEMORY_ALLOC_MAX + 2];
++    size_t n = 0;
++    ranges[n++] = (user_range){VM_HLE_INJECT_BASE,
++                              (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE};
++    ranges[n++] = (user_range){VM_PPU_TLS_BASE,
++                              (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE};
++    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
++        const sys_mem_alloc_info* a = &g_sys_mem_allocs[i];
++        if (a->active) ranges[n++] = (user_range){a->addr, (uint64_t)a->addr + a->size};
++    }
++    qsort(ranges, n, sizeof(ranges[0]), user_range_compare);
+     uint64_t candidate = SYS_MEM_ALLOC_BASE;
++    size_t i = 0;
+     for (;;) {
+         candidate = (candidate + alignment - 1u) & ~(uint64_t)(alignment - 1u);
+         if (candidate + size > SYS_MEM_ALLOC_END) return 0;
+-        uint64_t next = s_image_query ? s_image_query(candidate, candidate + size) : candidate;
+-        uint64_t injected = VM_HLE_INJECT_BASE;
+-        if (candidate < injected + VM_HLE_INJECT_SIZE && injected < candidate + size &&
+-            injected + VM_HLE_INJECT_SIZE > next)
+-            next = injected + VM_HLE_INJECT_SIZE;
+-        if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
+-            VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
+-            next = (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE;
+-        for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
+-            const sys_mem_alloc_info* a = &g_sys_mem_allocs[i];
+-            uint64_t end = (uint64_t)a->addr + a->size;
+-            if (a->active && candidate < end && a->addr < candidate + size && end > next)
+-                next = end;
+-        }
+-        if (next == candidate) return (uint32_t)candidate;
+-        candidate = next;
++        const uint64_t image_end = s_image_query
++            ? s_image_query(candidate, candidate + size) : candidate;
++        if (image_end > candidate) { candidate = image_end; continue; }
++        while (i < n && ranges[i].end <= candidate) ++i;
++        if (i == n || candidate + size <= ranges[i].start)
++            return (uint32_t)candidate;
++        if (ranges[i].end > candidate) candidate = ranges[i].end;
++        ++i;
+     }
+ }
+ 
+diff --git a/runtime/syscalls/sys_memory.h b/runtime/syscalls/sys_memory.h
+index e1b2dbf8..fb00971e 100644
+--- a/runtime/syscalls/sys_memory.h
++++ b/runtime/syscalls/sys_memory.h
+@@ -21,8 +21,9 @@ extern "C" {
+ #define SYS_MEMORY_PAGE_SIZE_1M   0x400
+ #define SYS_MEMORY_PAGE_SIZE_64K  0x200
+ 
+-/* Maximum tracked allocations */
+-#define SYS_MEMORY_ALLOC_MAX      1024
++/* Every 64 KiB page in the 256 MiB user address domain may be a separate
++ * allocation. A smaller record table reports ENOMEM before the byte budget. */
++#define SYS_MEMORY_ALLOC_MAX      4096
+ #define SYS_MEMORY_CONTAINER_MAX  16
+ #define SYS_MMAPPER_SHARED_MAX    64
+ 
+diff --git a/tests/test_user_memory_domain.c b/tests/test_user_memory_domain.c
+index 09b51e59..7414fc55 100644
+--- a/tests/test_user_memory_domain.c
++++ b/tests/test_user_memory_domain.c
+@@ -47,6 +47,10 @@ int main(void) {
+  CHECK(vm_base[VM_PPU_TLS_BASE]==0xA5);
+  uint32_t before=out(); CHECK(allocate(0x10000,0x200)!=(int64_t)CELL_OK); CHECK(out()==before);
+  reset();
++ /* Many small allocations must reach the same byte budget as one large one. */
++ for(unsigned page=0;page<213u*16u;page++) CHECK(allocate(0x10000,0x200)==CELL_OK);
++ CHECK(allocate(0x10000,0x200)!=(int64_t)CELL_OK);
++ reset();
+  ppu_hle_inject_base=0x10000000u;
+  CHECK(allocate(0x10000,0x200)==CELL_OK);CHECK(out()>=0x11000000u);
+  ppu_hle_inject_base=0x20000000u;

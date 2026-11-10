@@ -1,0 +1,23 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index ee710392..170fba0a 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -101,6 +101,7 @@ static volatile int s_flip_lock;
+  * while it's blocked in the FIFO-wrap recycle callback -- would show a
+  * clear+few-draws frame as a visible flicker). */
+ static volatile u32 s_flip_request_count = 0;
++static s32 gcm_flip_request(u32 bufferId, int in_fifo);
+ 
+ u32 cellGcm_flip_request_count(void)
+ {
+@@ -2943,9 +2944,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                  * current, GCM_FLIP_COMMAND, {id})). The flip happens here, when
+                  * the RSX reaches it -- see GCM_PREPAREFLIP_FIFO. */
+                 if (subch == 7 && m == 0x1EACu) {
+-                    extern s32 gcm_flip_request_ext(u32 bufferId, int in_fifo);
+                     const u32 id = dw & 0xFFu;
+-                    gcm_flip_request_ext(id, 1);
++                    gcm_flip_request(id, 1);
+                     gcm_set_current_display_buffer(id);
+                     s_flip_pending = 1;
+                     s_flip_request_count++;

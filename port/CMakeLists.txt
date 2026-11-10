@@ -165,7 +165,7 @@ elseif(PORT_ENABLE_SPU)
              "${PS3RECOMP_DIR}/runtime/spu/spu_dispatch_mt.c")
         # Generated beside the lift; each is present only once its generator
         # has been run, so each is included only if it is actually here.
-        foreach(gen IN ITEMS spu_workloads.c jobmods_register.c taskset_policy_bytes.c)
+        foreach(gen IN ITEMS spu_workloads.c spurs_jobs_register.c jobmods_register.c taskset_policy_bytes.c)
             if(EXISTS "${SPU_DIR}/${gen}")
                 list(APPEND SPU_SOURCES "${SPU_DIR}/${gen}")
             else()
@@ -180,6 +180,7 @@ endif()
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
+    spurs_queue.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
@@ -293,6 +294,11 @@ endif()
 # compile at once and stops on low memory.
 if(NOT MSVC)
     set_property(SOURCE ${RECOMP_SOURCES} APPEND PROPERTY COMPILE_OPTIONS "-O1")
+    # FIOS's fatal path in this chunk ends in a literal branch-to-self. C++'s
+    # forward-progress assumption otherwise removes the trampoline null check
+    # before that loop and turns a guest diagnostic into a native call to NULL.
+    set_property(SOURCE "${RECOMP_DIR}/ppu_recomp_004.cpp" APPEND PROPERTY
+        COMPILE_OPTIONS "-fno-finite-loops")
 endif()
 
 # The glue every guest load, store and import goes through. Unoptimized, each one is

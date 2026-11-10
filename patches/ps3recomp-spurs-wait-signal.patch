@@ -1,0 +1,39 @@
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index bb41b153..dc826b6f 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -2491,8 +2491,8 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+             extern volatile uint32_t g_spu_lfq_push_gen;
+             uint32_t lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
+             if (spu_taskset_consume_wake(ts) ||   /* a Set beat us to the park */
+-                spu_lfq_wait_satisfied(wobj) ||   /* or the queue already has work */
+-                lfq_gen != t_lfq_gen) {
++                (wobj && (spu_lfq_wait_satisfied(wobj) || /* queue-backed waits only */
++                          lfq_gen != t_lfq_gen))) {
+                 t_lfq_gen = lfq_gen;
+                 spu_ef_deliver_owed(ctx, wobj);
+                 ctx->gpr[3]._u32[0] = 0;
+@@ -2505,7 +2505,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+              * parked list; with a full fence on both sides one sees the other. */
+             __atomic_thread_fence(__ATOMIC_SEQ_CST);
+             lfq_gen = __atomic_load_n(&g_spu_lfq_push_gen, __ATOMIC_SEQ_CST);
+-            if (spu_lfq_wait_satisfied(wobj) || lfq_gen != t_lfq_gen) {
++            if (wobj && (spu_lfq_wait_satisfied(wobj) || lfq_gen != t_lfq_gen)) {
+                 t_lfq_gen = lfq_gen;
+                 spu_taskset_parked_del(ts, tid);
+                 yz_lockstep_block_end(ctx);
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 803212b6..5a542749 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -1310,7 +1310,9 @@ int spu_taskset_signal_parked_force(void)
+     int n = 0;
+     for (int i = 0; i < SPU_PARKED_MAX; i++) {
+         uint64_t k = s_parked[i];
+-        if (!k) continue;
++        /* A global LFQueue push is not a signal to a bare WAIT_SIGNAL.
++         * Only object-backed queue waiters may use this compatibility wake. */
++        if (!k || !s_parked_obj[i]) continue;
+         spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+         n++;
+     }

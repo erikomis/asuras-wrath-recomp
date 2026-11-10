@@ -9,6 +9,18 @@ feito.
 
 ## Resumo (10/11/2026)
 
+- **Atualização da continuação (fim do dia):** o job SPU do Bink ausente foi
+  capturado, liftado e registrado; o **menu de título renderiza pela
+  primeira vez** (texto/UI em faixas, contra o preto total de antes). O
+  vídeo de fundo ainda congela — a thread "Bink IO" bloqueia no semáforo
+  RADGAME que depende de pops da fila SPURS que param após o primeiro
+  vídeo — e o OOM dos ~290 s é consequência do loop de retry. Detalhes na
+  última seção do diário. **Ainda não há menu interativo confirmado.**
+- **Atualização da continuação:** build e link confirmados no Apple M4 Pro;
+  vídeos de carregamento e logotipos agora aparecem em Metal. Corrigidos
+  filas SPURS, estruturas de troféus e limite de registros do alocador.
+  **Ainda não há menu interativo nem gameplay confirmados.** Veja a seção
+  final deste diário para a evidência e o diagnóstico atual.
 - **Descoberta boa:** o disco já é a versão 01.02 do executável — o EBOOT do
   patch 1.02 oficial é byte-idêntico ao EBOOT do disco (SHA-256 conferido).
   As DLCs exigem 1.02, então não há um segundo executável para recompilar.
@@ -60,7 +72,7 @@ feito.
       Afro) **já descriptografa EDAT/SDAT em runtime** (`libs/filesystem/edat.c`,
       com o klicensee que o título passa ao `sceNpDrmIsAvailable`): o
       `PS3-BCGAME.INI.EDAT` da Part IV tem chance de abrir sem trabalho extra.
-- [ ] Compila e linka (em andamento, sem erros até a etapa 169/225).
+- [x] Compila e linka; boot com Metal verificado no Apple M4 Pro.
 
 A análise (`analysis/BLUS30721/EBOOT.*.json`): **30.350 funções** (2,4× o
 Afro Samurai), 292 imports de firmware de **21 bibliotecas** —
@@ -203,3 +215,143 @@ espera outra coisa primeiro. Ferramenta em mãos: SPURS_EF_SPU_REPLY
    0x00CEE0BC → o que o tick decide fazer depois do spin.
 3. Conferir se o cache.idx lido (512 bytes de header "fios") leva o
    jogo a considerar o cache válido ou se ele esperava mais entradas.
+
+### Continuação: erro real do boot e primeiro conteúdo carregado
+
+As pistas de espera acima foram superadas. A amostragem de threads em
+`cache/probe/continue03.tprof` mostrou a thread principal dentro do tratamento
+de erro do UE3, não esperando um request fios. O hook opcional
+`ASURA_GUEST_LOG=1` agora espelha a mensagem UTF-16BE de `Serialize` em
+`port/stubs.cpp`, preservando o tratamento original.
+
+O primeiro erro era `OOM -2143221883 2101314.000000 2052.064453`.
+O stub `cellOvisGetOverlayTableSize` exigia uma inicialização inexistente e
+declarava dois argumentos, enquanto o jogo passa um ELF SPU em memória e usa
+o retorno como tamanho. O erro `0x80410701`, acrescido de `0x84`, virava um
+pedido de alocação de mais de 2 GB. Os overrides do título devolvem uma tabela
+vazia para GetOverlayTableSize/InitializeOverlayTable, como o fallback atual
+do [RPCS3](https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellOvis.cpp).
+Isso é compatibilidade parcial, não implementação completa de overlays.
+`ASURA_OVIS_COMPAT=0` permite repetir a comparação com o stub original.
+
+Depois dessa correção, ENGINE.XXX, BCGAME.XXX, STARTUP.XXX e GUIDCACHE.XXX
+abriram, e apareceram comandos DRAW_ARRAYS. As capturas ainda são vazias ou
+de cor uniforme: draws isolados não comprovam imagem correta ou menu.
+
+Um job cru de **Edge Geometry**, fingerprint `42E1FC8CEE0BE246`, 34.688 bytes,
+era descartado por falta de registro. `tools/lift_spurs_jobs.py` agora traduz
+os dumps `spujob_*.bin`, confere tamanho/fingerprint e gera o registro separado
+`port/spu/spurs_jobs_register.c`. O código acaba em LS `0x7834`; a tabela de
+strings seguinte foi excluída da análise de instruções. `continue11.log`
+confirmou entrada e retorno desse job ao gerenciador.
+
+Para capturar e gerar jobs faltantes:
+
+```sh
+tools/probe.sh novos-jobs 30 ASURA_GUEST_LOG=1 SPU_DUMP_MISS="$PWD/cache/probe"
+source tools/env.sh
+"$PY" tools/lift_spurs_jobs.py --toolkit "$PS3RECOMP_DIR"
+tools/build.sh
+```
+
+A tarefa SPU de áudio (`spu_0000`, imagem 1, `spu/msngSPURS_MP3`) avançava
+apesar de um WAIT_SIGNAL sem objeto. O runtime liberava essa espera por uma
+mudança na geração global de LFQueue. O patch agora restringe essa exceção
+a esperas com objeto; o teste `tools/test_spurs_plain_signal.py` passou
+**11 verificações**. Os patches do toolkit estão preservados em `patches/`.
+Os testes de helpers NEON inteiros e de ponto flutuante do SDK também passaram.
+
+**Estado mais recente (`cache/probe/continue13.log`):** o boot abre
+BC-FRONTEND.XXX, BUTTONS_SF.XXX, PAUSEMENU_SF.XXX, GFXTEXT_SF.XXX e GUIDCACHE
+das DLCs. Ainda há DMAs de tamanho zero na tarefa de áudio e, depois, outro
+OOM com tamanho inválido (`862895164` nessa execução), seguido de SIGSEGV.
+Não está jogável. O próximo diagnóstico deve capturar a origem desse novo
+tamanho de alocação e a escrita que o corrompe, além de conferir a handshake
+do MultiStream com o PPU. As tentativas com helpers escalares e
+`--return-entries --merge-chunks` na imagem de áudio não resolveram a falha
+e foram revertidas. `SPURS_JOB_CTX_V1=1` também não foi adotado como padrão.
+
+Também corrigidos: `env.sh` define Python antes de usá-lo ao buscar chaves;
+`probe.sh` remove capturas anteriores do mesmo rótulo, aceita ausência de
+frames e devolve o código de erro quando o processo termina sozinho.
+
+### Continuação: filas reais, memória e primeiros vídeos visíveis
+
+Os OOMs descritos acima tiveram três causas distintas, agora corrigidas:
+
+- `cellSpursQueuePopBody` devolvia sucesso sem copiar o resultado da fila.
+  Os workers interpretavam dados antigos da pilha como tamanhos de alocação.
+  `port/spurs_queue.cpp` implementa push/pop, peek, wrap e espera, com acesso
+  big endian e sinalização das tarefas SPU. O teste independente
+  `port/tests/spurs_queue_test.cpp` cobre FIFO, fila cheia/vazia e handoffs
+  bloqueantes.
+- As contagens de troféus eram gravadas na ordem de bytes do host: 32 virava
+  `0x20000000` no PPU. O patch de troféus corrige também os tamanhos das
+  estruturas públicas e os campos numéricos de informações individuais.
+- A tabela de alocações acabava em 1.024 entradas, antes dos 213 MB do
+  orçamento de usuário. A capacidade agora cobre todas as páginas possíveis;
+  a busca ordenada mantém o reaproveitamento e a proteção das imagens ELF.
+  Passaram 3.446 verificações do alocador e 26 de imagens carregadas.
+
+A liberação indevida de WAIT_SIGNAL também ocorria no fallback que acordava
+qualquer tarefa por atividade de LFQueue. Ele agora preserva as esperas sem
+objeto. O harness de 11 verificações inclui esse caminho.
+
+Um loop infinito literal no tratamento fatal de FIOS permitia ao compilador
+eliminar a verificação de ponteiro do trampoline. `-fno-finite-loops` no chunk
+PPU 004 preserva esse caminho sem transformá-lo em chamada nativa a NULL.
+
+**Tela verde resolvida:** Asura usa diretamente a primeira página da segunda
+reserva do mmapper para os frames Bink. `PS3_MAPPER_WIDE=1`, herdado como
+ponto de partida do Afro Samurai, reservava `0x50000000`, a heap do HLE.
+Os mapas retornavam EBUSY e os descritores de textura permaneciam zerados.
+O padrão deste título agora é `PS3_MAPPER_WIDE=0`: a segunda reserva começa
+em `0x70000000`, sem colisão. `cache/probe/safe22_t010.ppm` mostra a animação
+de carregamento, e as capturas seguintes mostram os logotipos dos vídeos.
+
+`menu23`, teste de 150 segundos com input programado, chegou à abertura de
+`TITLEMENU_BG00.BIK`, mas ficou com imagem preta. A amostragem tardia mostra
+a thread principal esperando um evento e a thread de renderização em
+`00874EF0`, aguardando progresso gráfico. **Ainda não está jogável.** O
+próximo diagnóstico acompanha a publicação de fences e o consumo do FIFO.
+
+### Continuação: o job do Bink registrado, o menu renderiza, o vídeo congela
+
+O `dispatch MISS fp=0xD6E964B601AB14C0 size=528` do fim do dia anterior foi
+capturado com `SPU_DUMP_MISS` (probe `jobs25`), liftado (14 funções, imagem 29)
+e registrado em `port/spu/spurs_jobs_register.c` — o `lift_spu.sh` agora inclui
+os dumps pendentes automaticamente. O job despacha e roda: 3.170 HITs no probe
+`menu27` (com `PS3_VERBOSE=1`; o HIT de job SPURS é verbose-only e os logs
+`bin/ENTER` saturam nas primeiras 4 ocorrências por processo, então um job
+rodando pode não deixar nenhuma linha visível no log padrão).
+
+**Primeiro conteúdo de menu na tela:** o frame congelado do título mostra
+conteúdo em faixas horizontais (linhas 180–540) contra o preto total do
+`menu23`. O input chega (PAD_SCRIPT entregue, 4 eventos) mas a tela não muda.
+
+O diagnóstico do congelamento (amostra de threads do macOS em
+`cache/probe/bink30.sample.txt`, capturada com `sample <pid> 5` — muito mais
+rápida que attach de lldb num binário de 573 MB):
+
+- A thread "Bink IO" (entry OPD `0x01994498` → `func_01522008`) bloqueia em
+  `sys_semaphore_wait` do semáforo `RADGAME` (sem=1):
+  `func_01522008 → func_015149E8+3740 → func_0152161C+804 → sys_semaphore_wait`.
+- Os `semaphore_post(sem=1 'RADGAME')` param de vez na era do
+  `00_AUTOSAVE.BIK` (~23% do log). Depois disso nenhum vídeo (CAPCOMLOGO,
+  CC2LOGO, UE3LOGO, SPEEDTREELOGO, TITLEMENU_BG00) recebe post.
+- No período que funciona, cada post vem de um pop da fila SPURS
+  (`[asura queue] pop q=01B32980` → `semaphore_post`). Depois, zero pops.
+- **Zero bytes lidos de qualquer .BIK em todo o run.** A "animação" dos
+  primeiros ~40 s é UI do UE3, não vídeo; o `safe22` congelava no mesmo
+  ponto — os vídeos nunca animaram além do primeiro frame estático.
+- Suspeitos: as event queues 6/7 enchem (`port_send` → EBUSY) e ninguém as
+  drena; as threads receptoras esperam `sys_event_queue_receive` em filas
+  que nunca recebem. É o elo entre o fios e o Bink.
+- O OOM dos ~290 s é **consequência** do congelamento: o jogo recria as
+  tasks fios em loop de retry (CreateTask id 6.800+, ~10 alocações de 64 KB/s
+  sem nenhum free — 2.932 até esgotar os 213 MB de memória de usuário).
+
+O `tools/probe.sh` agora verifica o SIGKILL final: um probe do bink29
+terminou alegando ter parado e deixou o jogo órfão rodando (ainda escrevendo
+no mesmo log). Nenhum dado do jogo vai ao repositório (gitignore cobre
+`port/spu/` e os dumps).

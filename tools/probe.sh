@@ -13,6 +13,9 @@ here=${0:A:h}; source "$here/env.sh"
 label=${1:?label}; secs=${2:?seconds}; shift 2
 out=$ASURA_ROOT/cache/probe; mkdir -p "$out"
 log=$out/$label.log
+# Reusing a label must not report an old frame as evidence of this run.
+old_frames=("$out/$label.ppm"(N) "$out/${label}_t"*.ppm(N))
+(( ${#old_frames} )) && rm -f -- "${old_frames[@]}"
 caffeinate -i "$here/run.sh" PS3RECOMP_METAL_HEADLESS=1 \
     PS3RECOMP_METAL_FRAME_DUMP="$out/$label.ppm" "$@" > "$log" 2>&1 &
 pid=$!
@@ -28,11 +31,18 @@ while kill -0 $pid 2>/dev/null && (( t < secs )); do
     fi
 done
 if kill -0 $pid 2>/dev/null; then
-    # caffeinate's child is the game; stop both, children first.
+    # caffeinate's child is the game; stop both, children first. SIGKILL is
+    # verified: one run left the game alive with the probe claiming it had
+    # stopped, and the orphan kept burning a core writing to the same log.
     pkill -TERM -P $pid 2>/dev/null; sleep 1; kill -TERM $pid 2>/dev/null
     sleep 1; pkill -KILL -P $pid 2>/dev/null; kill -KILL $pid 2>/dev/null
+    sleep 1; kill -KILL $pid 2>/dev/null
+    kill -0 $pid 2>/dev/null && echo "probe: WARNING: pid $pid survived SIGKILL" >&2
     echo "probe: stopped after ${secs}s"
 else
-    wait $pid; echo "probe: exited rc=$? after ${t}s"
+    wait $pid; rc=$?
+    echo "probe: exited rc=$rc after ${t}s"
 fi
-echo "probe: $(wc -l < "$log") log lines, $(ls "$out"/$label*.ppm 2>/dev/null | wc -l | tr -d ' ') frame dumps"
+frames=("$out/$label.ppm"(N) "$out/${label}_t"*.ppm(N))
+echo "probe: $(wc -l < "$log") log lines, ${#frames} frame dumps"
+exit ${rc:-0}

@@ -61,3 +61,10 @@ fi
 
 "$PY" "$KIT/build_spu_workloads.py" --images "$IMG" \
     --lifted "$SPU" --out "$SPU/spu_workloads.c" --constructor --skip-lift
+
+# Raw SPURS jobs are separate from the embedded ELFs. Capture unknown jobs
+# with SPU_DUMP_MISS=$ASURA_ROOT/cache/probe, then include them on the next lift.
+jobs=("$ASURA_ROOT/cache/probe"/spujob_*.bin(N))
+if (( ${#jobs} )); then
+    "$PY" "$here/lift_spurs_jobs.py" --toolkit "$PS3RECOMP_DIR"
+fi

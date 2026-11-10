@@ -89,6 +89,7 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
  * into guest RAM and register their exports. stubs.cpp has the empty version
  * a game with no lifted PRX wants. */
 void     ps3_load_prx_modules(void);
+void     ps3_install_title_hooks(void);
 
 extern const char* ppu_vfs_root;              /* host dir the PS3 mount points map into */
 
@@ -500,9 +501,11 @@ static void asura_defaults(void)
      *     pages with map_memory; the untracked cursor overlapped the two in
      *     the Afro port and the title abort()ed. */
     setenv("PS3_MMAPPER_TRACK", "1", 0);
-    /* PS3_MAPPER_WIDE      room for large ascending address reservations;
-     *     Afro's six (512 MB + 5 x 256 MB) came back ENOMEM otherwise. */
-    setenv("PS3_MAPPER_WIDE", "1", 0);
+    /* Asura maps video frames directly at the start of its second reservation.
+     * Wide reservations can start at the runtime's 0x50000000 HLE heap; the
+     * tracked mapper then rejects every frame mapping with EBUSY. Preserve
+     * runtime-owned windows so the reservation is usable from its first page. */
+    setenv("PS3_MAPPER_WIDE", "0", 0);
     /* SPU_INTERP_UNLIFTED  run SPU code that has no lifted body interpreted
      *     (Deadpool and Afro both needed it; UE3 titles overlay SPU modules).
      *     Revisit once this port's own SPU images are lifted. */
@@ -586,6 +589,7 @@ int main(int argc, char** argv)
     ppu_sysprx_register();   /* boot-critical CRT */
     ppu_fs_register();       /* cellFs over the game directory */
     lv2_init_syscalls();     /* the lv2 syscall table */
+    ps3_install_title_hooks(); /* title overrides, after the SDK registrations */
     text_ro_arm();           /* ASURA_TEXT_RO=1 diagnostic */
 
     /* Install the guest-callback hook, then start the frame clock. It no-ops

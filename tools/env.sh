@@ -25,6 +25,8 @@ export ASURA_TITLE_ID=BLUS30721
 export ASURA_GAME=${ASURA_GAME:-$ASURA_ROOT/game}
 export ASURA_EBOOT=${ASURA_EBOOT:-$ASURA_GAME/EBOOT.elf}
 export ASURA_EBOOT_BIN=${ASURA_EBOOT_BIN:-$ASURA_GAME/EBOOT.BIN}
+export ASURA_VENV=${ASURA_VENV:-$ASURA_ROOT/../deadpool-recomp/tools/.venv}
+export PY=${PY:-$ASURA_VENV/bin/python}
 export ASURA_ANALYSIS=${ASURA_ANALYSIS:-$ASURA_ROOT/analysis/$ASURA_TITLE_ID}
 export ASURA_RECOMP=${ASURA_RECOMP:-$ASURA_ROOT/recompiled/$ASURA_TITLE_ID}
 export ASURA_BUILD=${ASURA_BUILD:-$ASURA_ROOT/build/$ASURA_TITLE_ID}
@@ -46,6 +48,3 @@ export ASURA_VFS_ROOT=${ASURA_VFS_ROOT:-$ASURA_ROOT/rpcs3/dev_hdd0/disc/$ASURA_T
 export ASURA_DLC_PKG=${ASURA_DLC_PKG:-$ASURA_ROOT/dlc/pkg}
 export ASURA_DLC_OUT=${ASURA_DLC_OUT:-$ASURA_ROOT/dlc/extracted}
 export ASURA_HDD0=${ASURA_HDD0:-$ASURA_ROOT/rpcs3/dev_hdd0}
-export ASURA_VENV=${ASURA_VENV:-$ASURA_ROOT/../deadpool-recomp/tools/.venv}
-# zsh: ${:-} fallbacks need the var unset, not empty, for re-sourcing
-export PY=${PY:-$ASURA_VENV/bin/python}

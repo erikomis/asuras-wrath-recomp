@@ -1,0 +1,4 @@
+# Jump tables whose case targets must be lifted as function entries
+# (tools/augment_functions.py). Hex: <r2 offset of module TOC> <module offset of table> <entries>
+# None found yet for BLUS30721; add tables as "unresolved indirect call"
+# targets show up in the logs.

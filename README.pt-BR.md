@@ -1,6 +1,6 @@
 # Asura's Wrath — recompilação estática para PC (macOS)
 
-🇧🇷 **Português (BR)** · [English](README.md) *(a traduzir)*
+🇧🇷 **Português (BR)** · [English](README.md)
 
 Port nativo do **Asura's Wrath** (PS3, disco `BLUS30721`, v01.02) para
 **macOS/arm64**, feito com recompilação estática: o código PowerPC e SPU do
@@ -19,9 +19,13 @@ com o jogo — veja [docs/DLC.md](docs/DLC.md).
 | Plataforma alvo | macOS com Apple silicon, gráficos em Metal |
 
 > [!WARNING]
-> **Trabalho em andamento, no começo.** Ainda não chega à gameplay. Não há
-> releases: você mesmo compila o jogo a partir do seu próprio disco. O que
-> falta está no [ROADMAP.pt-BR.md](ROADMAP.pt-BR.md).
+> **Alfa inicial, não jogável até o fim.** Em probes sem janela, o jogo chega
+> ao título, cria ou carrega o save, entra em NEW GAME, toca a abertura do
+> Episódio 1 e chega aos primeiros QTEs sem erro no log (relato do
+> desenvolvedor). **O áudio não funciona**, e a execução em janela, a resposta
+> aos QTEs e o resto do episódio não foram verificados. Não há releases: você
+> mesmo compila o jogo a partir do seu próprio disco. O que falta está no
+> [ROADMAP.pt-BR.md](ROADMAP.pt-BR.md).
 
 > **Este repositório não contém dados do jogo, firmware, chaves da Sony nem
 > nada traduzido a partir deles.** Cada um gera tudo isso localmente a partir
@@ -70,18 +74,25 @@ docs/          DLC.md e outros
 ## Estado
 
 - [x] Disco inventariado: BLUS30721 v01.02, UE3 da CyberConnect2, Bink,
-      middleware UE3 padrão, 6,5 GB de `COOKEDPS3`.
-- [x] EBOOT.BIN (SELF key_rev 0x0016) descriptografado sem o RPCS3.
-- [x] **EBOOT do patch 1.02 conferido: byte-idêntico ao do disco** (o disco já
-      é a versão final do executável — as DLCs exigem 1.02, e já temos).
-- [x] As DLCs baixadas da CDN da Sony e desempacotadas: **Part IV: Nirvana
-      (final verdadeiro)**, Lost Episodes 1 e 2 (crossover Street Fighter),
-      patch 1.02. Linkadas no VFS no layout que o instalador da Sony usa.
-- [x] PPU analisado e traduzido.
-- [x] 27 imagens SPU extraídas e traduzidas; um job Edge Geometry adicional registrado.
-- [x] Compila e inicia no macOS/arm64 com Metal (Apple M4 Pro).
-- [x] Vídeos de carregamento e logotipos renderizados em Metal.
-- [ ] Execução estável até o menu e partida; investigação em andamento.
-- [ ] Boot → menus → gameplay.
+      6,5 GB de `COOKEDPS3`.
+- [x] EBOOT.BIN (SELF key_rev 0x0016) descriptografado sem o RPCS3; o do
+      patch 1.02 é byte-idêntico ao do disco.
+- [x] As DLCs baixadas da CDN da Sony e desempacotadas (Part IV: Nirvana,
+      Lost Episodes 1 e 2), linkadas no VFS. Nunca carregadas pelo jogo.
+- [x] PPU analisado e traduzido; 27 imagens SPU extraídas e traduzidas.
+- [x] Compila e inicia no macOS/arm64 com Metal.
+- [x] Boot, first-boot install, vídeos de carregamento e logotipos.
+- [x] Título, save e NEW GAME em probes sem janela.
+- [x] Abertura do Episódio 1, menu de pausa e primeiros QTEs em um probe
+      sem janela de 470 s, sem erro no log (relato do desenvolvedor).
+- [ ] Áudio (não funciona).
+- [ ] Execução em janela, QTEs respondendo, o Episódio 1 até o fim.
+- [ ] Episódios 19-22 (Part IV: Nirvana).
 
-Veja o [ROADMAP.pt-BR.md](ROADMAP.pt-BR.md).
+Veja o [ROADMAP.pt-BR.md](ROADMAP.pt-BR.md) e os [créditos](CREDITS.pt-BR.md).
+
+## Licença
+
+O código próprio do port é MIT ([LICENSE](LICENSE)); o ps3recomp mantém a
+licença dele. Asura's Wrath pertence à Capcom e à CyberConnect2; nenhuma parte
+do jogo está incluída.

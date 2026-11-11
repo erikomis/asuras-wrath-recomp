@@ -91,3 +91,6 @@ runs/
 .idea/
 __pycache__/
 *.pyc
+
+# Local orchestration notes (not part of the port)
+ASURAS_WRATH_MULTIAGENTE.md

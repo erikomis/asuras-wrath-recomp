@@ -24,7 +24,8 @@ Os arquivos abaixo só contêm alterações do runtime, sem dados do jogo.
   físico fora de probes com roteiro; `GCM_USER_CMD_QUEUE` entrega um user
   command por chamada do handler; e os diagnósticos `GCM_USER_WATCH` e
   `SPU_PUT_VALWATCH`. Tudo opt-in por variável de ambiente, exceto a correção
-  do lifter.
+  do lifter e `cellSpursQueueDetachLv2EventQueue`, que deixa de ser um import
+  não resolvido (o título o chama 40 vezes ao carregar o primeiro mapa).
 
 Em um checkout compatível, confira e aplique cada patch com
 `git -C ../ps3recomp-asura apply --check <caminho-absoluto-do-patch>` e

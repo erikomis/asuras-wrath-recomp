@@ -17,6 +17,41 @@ index 5f8a2fa2..64f782f4 100644
      const int n = SDL_NumJoysticks();   /* also refreshes sdl2-compat's index list */
      for (int idx = 0; idx < n; idx++) {
          if (!SDL_IsGameController(idx)) continue;
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index ff0ef6fc..c96921de 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -3800,6 +3800,18 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea)
+     return CELL_OK;
+ }
+ 
++/* cellSpursQueueDetachLv2EventQueue(CellSpursQueue*) -- the other half.
++ * Attach above binds nothing, so there is nothing to release; but leaving
++ * the import unresolved returns whatever r3 held (the queue EA) as the
++ * result, which a caller that checks it reads as an error. Asura's Wrath
++ * detaches its 40 task queues while the first map loads. */
++s32 cellSpursQueueDetachLv2EventQueue(u64 queue_ea)
++{
++    static int _n = 0;
++    if (PS3_LOG_FIRST(_n, 8)) printf("[cellSpurs] QueueDetachLv2EventQueue(q=0x%08X)\n", (u32)queue_ea);
++    return CELL_OK;
++}
++
+ /* _cellSpursLFQueueInitialize(void* pTasksetOrSpurs, CellSpursLFQueue* pQueue,
+  *      const void* buffer, u32 size, u32 depth, u32 direction)
+  *
+diff --git a/libs/spurs/cellSpurs.h b/libs/spurs/cellSpurs.h
+index adfbf89c..7e263927 100644
+--- a/libs/spurs/cellSpurs.h
++++ b/libs/spurs/cellSpurs.h
+@@ -315,6 +315,7 @@ s32 cellSpursBarrierInitialize(u64 taskset_ea, u64 barrier_ea, u32 total);
+ s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea);
+ s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size);
+ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
++s32 cellSpursQueueDetachLv2EventQueue(u64 queue_ea);
+ s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea);
+ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
+                                 u32 size, u32 depth, u32 direction);
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 index ee710392..59832926 100644
 --- a/libs/video/cellGcmSys.c

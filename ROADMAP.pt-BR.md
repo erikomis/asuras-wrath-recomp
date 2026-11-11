@@ -1,6 +1,6 @@
 # Roadmap
 
-🇧🇷 **Português (BR)** · [English](ROADMAP.md) *(a traduzir)*
+🇧🇷 **Português (BR)** · [English](ROADMAP.md)
 
 Estado do port nativo do Asura's Wrath (`BLUS30721`) para macOS/arm64 e o que
 vem a seguir. Mesma organização dos roadmaps do Afro Samurai e dos outros

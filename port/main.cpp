@@ -510,6 +510,44 @@ static void asura_defaults(void)
      *     (Deadpool and Afro both needed it; UE3 titles overlay SPU modules).
      *     Revisit once this port's own SPU images are lifted. */
     setenv("SPU_INTERP_UNLIFTED", "1", 0);
+    /* SPURS_JC_EVENT_FROM_JOB  a job chain posts no event of its own; only the
+     *     events its jobs send reach an attached queue (the hardware
+     *     behaviour). The game's chunk allocator ("CellMemoryManager" thread,
+     *     func_00A7901C) attaches queue 5 with cellSpursAttachLv2EventQueue
+     *     and reads data2 as "back one more 32 KB chunk for slot N". The
+     *     runtime's synthetic "job N done" event per job landed in that queue,
+     *     so every finished job allocated a chunk: 2,900 of them, all 213 MB
+     *     of user memory, then UE3's OOM handler parked holding the allocator
+     *     lock and the main and rendering threads froze behind it at the
+     *     title screen. */
+    setenv("SPURS_JC_EVENT_FROM_JOB", "1", 0);
+    /* GCM_USER_CMD_QUEUE  one user-handler call per GCM_SET_USER_COMMAND, in
+     *     order. UE3's handler advances the fence counter the rendering thread
+     *     sleeps on (func_008736F8); the runtime's single pending slot merged
+     *     two commands retired between pumps into one call, the counter stayed
+     *     one short and the picture froze at a random point (2 boots in 7). */
+    setenv("GCM_USER_CMD_QUEUE", "1", 0);
+    /* SPURS_JG_WAIT_FOREVER  a job chain's walker stays on END and goes on from
+     *     that slot when the PPU writes work over it. UE3's "ShaderPatching"
+     *     chain (jc 0x01A96980, commands at 0x01A75780) is append-only: the
+     *     game replaces the next END with a JOB and calls
+     *     cellSpursRunJobChain. A walker that exits at END is restarted from
+     *     the entry by that call and runs every earlier job again -- about
+     *     450 Edge jobs per call by the title menu -- and each job PUTs its
+     *     sequence number to the counter at 0x01A96900 that the rendering
+     *     thread sleeps on (func_008736F8), so the counter swept 1..N on every
+     *     call. A call that arrived while the previous sweep was leaving was
+     *     coalesced away, its job never ran and the picture froze for good
+     *     (the intermittent freeze, 3 boots in 10). */
+    setenv("SPURS_JG_WAIT_FOREVER", "1", 0);
+    /* SPU_CRI_IMAGE=0  this title has no CRI movie task. The runtime's CRI
+     *     special cases key on image id 22, which here is the PhysX task
+     *     (spu_0021_at_018ECF00, tasks created with arg {queue 0x01B2E700,
+     *     index, params 0x13A35F80}). Treated as CRI it got the wrong
+     *     SpursTasksetContext, fetched its parameters from EA 0 and spun on a
+     *     reservation at 0x00400000; the main thread then waited on the
+     *     physics step for ever, right after BC-S000 and the HUD loaded. */
+    setenv("SPU_CRI_IMAGE", "0", 0);
 
     /* Not enabled for this title yet (the Afro Samurai port's choices,
      * kept here as the reference list of what to reach for when the boot

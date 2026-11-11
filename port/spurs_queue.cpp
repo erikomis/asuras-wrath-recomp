@@ -74,8 +74,19 @@ uint32_t transfer(uint32_t q, uint32_t data, bool push, bool peek, bool blocking
             spu_lockline_unlock();
             if (taskset && (push || !peek))
                 spu_taskset_signal_parked_obj(taskset, q);
+            /* ASURA_QUEUE_LOG=<n>: first n transfers are logged (default 16,
+             * matching the other first-N diagnostics). The default hid the
+             * fios/Bink handshake right where the videos stall: set it high
+             * to see whether pushes/pops continue past the first video. */
+            static std::atomic<int> cap{-1};
+            int c = cap.load();
+            if (c < 0) {
+                const char* e = getenv("ASURA_QUEUE_LOG");
+                c = e ? atoi(e) : 16;
+                cap.store(c);
+            }
             static std::atomic<unsigned> messages{0};
-            if (messages.fetch_add(1) < 16)
+            if (messages.fetch_add(1) < (unsigned)c)
                 fprintf(stderr, "[asura queue] %s q=%08X slot=%u size=%u count=%u\n",
                         push ? "push" : (peek ? "peek" : "pop"), q,
                         index % depth, size, count);
@@ -84,8 +95,15 @@ uint32_t transfer(uint32_t q, uint32_t data, bool push, bool peek, bool blocking
         spu_lockline_unlock();
         if (!blocking) return AGAIN;
         if (!reported_wait) {
-            static std::atomic<unsigned> messages{0};
-            if (messages.fetch_add(1) < 16)
+            static std::atomic<int> wcap{-1};
+            int wc = wcap.load();
+            if (wc < 0) {
+                const char* e = getenv("ASURA_QUEUE_LOG");
+                wc = e ? atoi(e) : 16;
+                wcap.store(wc);
+            }
+            static std::atomic<unsigned> wmessages{0};
+            if (wmessages.fetch_add(1) < (unsigned)wc)
                 fprintf(stderr, "[asura queue] waiting to %s q=%08X count=%u\n",
                         push ? "push" : "pop", q, count);
             reported_wait = true;

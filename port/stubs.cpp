@@ -26,6 +26,41 @@ void func_000F3BE0(ppu_context*);
  * Mirror its UTF-16BE message before the original enters error handling;
  * otherwise the release build can leave only a black screen in the host log.
  * This hook observes the message and preserves the guest's error path. */
+/* Diagnostic: the "CellMemoryManager" thread (func_00A7901C) backs a table of
+ * chunk lists that SPU tasks and PPU callers bump-allocate from. The table is
+ * at [TOC-0x5BA0]; slots start at +0x200, 16 bytes each: head, current,
+ * pending flag, spinlock. A node is {generation, base, cursor, size,
+ * remaining, next}. Printing the chain lengths at the fatal error shows which
+ * slot grew until user memory ran out. */
+static void asura_dump_chunk_manager(void)
+{
+    const uint32_t mgr = vm_read32(0x019AF8F8u - 0x5BA0u);
+    if (mgr < 0x10000u) return;
+    fprintf(stderr, "[asura chunks] mgr=0x%08X dirty=%u init=%u port=%u queue=%u alloc=0x%08X\n",
+            mgr, vm_read8(mgr), vm_read8(mgr + 1), vm_read32(mgr + 4),
+            vm_read32(mgr + 0x10), vm_read32(mgr + 0x14));
+    unsigned total = 0;
+    for (uint32_t i = 0; i < 512; ++i) {
+        const uint32_t slot = mgr + 0x200 + i * 16;
+        const uint32_t head = vm_read32(slot);
+        if (!head) continue;
+        unsigned nodes = 0, backed = 0;
+        uint64_t bytes = 0;
+        uint32_t gen = vm_read32(head), last = head;
+        for (uint32_t n = head; n >= 0x10000u && nodes < 100000; n = vm_read32(n + 0x14)) {
+            ++nodes; last = n;
+            if (vm_read32(n + 4)) { ++backed; bytes += vm_read32(n + 0xC); }
+        }
+        total += backed;
+        fprintf(stderr, "[asura chunks] slot %3u head=0x%08X cur=0x%08X pend=%u lock=%u "
+                "nodes=%u backed=%u bytes=%llu gen(head)=%u last=0x%08X last.rem=%u/%u\n",
+                i, head, vm_read32(slot + 4), vm_read32(slot + 8), vm_read32(slot + 0xC),
+                nodes, backed, (unsigned long long)bytes, gen, last,
+                vm_read32(last + 0x10), vm_read32(last + 0xC));
+    }
+    fprintf(stderr, "[asura chunks] backed chunks total=%u\n", total);
+}
+
 static void asura_error_serialize(ppu_context* ctx)
 {
     const uint32_t address = (uint32_t)ctx->gpr[4];
@@ -50,6 +85,7 @@ static void asura_error_serialize(ppu_context* ctx)
     fprintf(stderr, "[asura error] lr=0x%08X category=0x%X: %s\n",
             (uint32_t)ctx->lr, (uint32_t)ctx->gpr[5], message);
     ppu_dump_guest_stack(ctx, "asura-error");
+    asura_dump_chunk_manager();
     func_000F3BE0(ctx);
 }
 

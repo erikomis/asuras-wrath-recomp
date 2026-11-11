@@ -16,7 +16,9 @@ log=$out/$label.log
 # Reusing a label must not report an old frame as evidence of this run.
 old_frames=("$out/$label.ppm"(N) "$out/${label}_t"*.ppm(N))
 (( ${#old_frames} )) && rm -f -- "${old_frames[@]}"
-caffeinate -i "$here/run.sh" PS3RECOMP_METAL_HEADLESS=1 \
+# PAD_NO_CONTROLLER=1: a probe is scripted; a controller left plugged in must
+# not add presses of its own (PAD_NO_CONTROLLER= on the command line undoes it).
+caffeinate -i "$here/run.sh" PS3RECOMP_METAL_HEADLESS=1 PAD_NO_CONTROLLER=1 \
     PS3RECOMP_METAL_FRAME_DUMP="$out/$label.ppm" "$@" > "$log" 2>&1 &
 pid=$!
 echo "probe: pid $pid, log $log"

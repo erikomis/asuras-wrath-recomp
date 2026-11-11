@@ -1,0 +1,442 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 5f8a2fa2..64f782f4 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -586,6 +586,14 @@ static void pad_sdl_close(int p, int gone)
+ /* Open every game controller SDL lists that no port has yet. */
+ static void pad_sdl_scan(void)
+ {
++    /* PAD_NO_CONTROLLER=1: leave physical controllers closed. A scripted run
++     * (PAD_SCRIPT) is only reproducible when nothing else presses buttons: a
++     * controller left plugged in, with a drifting stick or a hand on it,
++     * moved the cursor between the script's presses and each headless probe
++     * of the same script ended on a different menu. */
++    { static int off = -1;
++      if (off < 0) off = getenv("PAD_NO_CONTROLLER") ? 1 : 0;
++      if (off) return; }
+     const int n = SDL_NumJoysticks();   /* also refreshes sdl2-compat's index list */
+     for (int idx = 0; idx < n; idx++) {
+         if (!SDL_IsGameController(idx)) continue;
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index ee710392..59832926 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -351,6 +352,31 @@ static _Atomic(u64) s_user_pending = 0;
+ #define GCM_USER_PENDING_TAKE() atomic_exchange(&s_user_pending, 0)
+ #endif
+ 
++/* GCM_USER_CMD_QUEUE=1: deliver every GCM_SET_USER_COMMAND to the guest handler,
++ * in order, instead of coalescing the ones still pending into the newest.
++ *
++ * The single pending slot above models a cause register: a second command that
++ * the FIFO retires before the pump has run replaces the first, and the handler
++ * runs once. A title whose handler COUNTS its calls then comes up one short.
++ * Asura's Wrath (UE3) advances a fence counter in that handler and its
++ * rendering thread sleeps in func_008736F8 until the counter reaches the fence
++ * it submitted; one coalesced pair left it one behind for good, and the title
++ * froze at a random moment of the intro or the menu (2 boots in 7). On the
++ * console the interrupt thread services each command long before the RSX
++ * reaches the next, so in practice a title sees one call per command.
++ *
++ * Single producer (the FIFO walker), single consumer (the pump, under
++ * GCM_PUMP_TRY_ENTER). */
++#define GCM_USER_RING 256u
++static u32 s_user_ring[GCM_USER_RING];
++static volatile u32 s_user_ring_head = 0, s_user_ring_tail = 0;
++static int gcm_user_cmd_queue_on(void)
++{
++    static int on = -1;
++    if (on < 0) { const char* e = getenv("GCM_USER_CMD_QUEUE"); on = (e && e[0] == '1') ? 1 : 0; }
++    return on;
++}
++
+ /* Tile configuration (up to 15 tiles, 8 commonly used) */
+ static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
+ 
+@@ -948,6 +974,43 @@ static DWORD WINAPI gcm_intr_main(LPVOID unused)
+ static void* gcm_intr_posix(void* a) { gcm_intr_main(a); return NULL; }
+ #endif
+ 
++#ifndef _WIN32
++#include <unistd.h>
++#endif
++/* GCM_USER_WATCH=1: every 2 s, where the user-command path stands. A fence a
++ * title waits on moves only when (a) the walker retires the command, (b) the
++ * pump takes it and (c) the guest handler returns; the three counters and the
++ * FIFO registers say which of those stopped. */
++static volatile unsigned long s_uw_queued = 0, s_uw_delivered = 0, s_uw_pumps = 0, s_uw_busy = 0;
++static volatile int s_uw_in_handler = 0;
++#ifndef _WIN32
++static void* gcm_user_watch_main(void* unused)
++{
++    (void)unused;
++    for (;;) {
++        sleep(2);
++        fprintf(stderr, "[gcm-watch] queued=%lu delivered=%lu ring=%u/%u pend=%d upend=%d "
++                "pumps=%lu busy=%lu in_handler=%d put=0x%X get=0x%X ref=0x%X walker_get=0x%X flip=%u\n",
++                s_uw_queued, s_uw_delivered, (unsigned)s_user_ring_tail, (unsigned)s_user_ring_head,
++                (int)(s_gcm_pending != 0), (int)(s_user_pending != 0), s_uw_pumps, s_uw_busy,
++                s_uw_in_handler,
++                vm_read32(GCM_CONTROL_GUEST_ADDR + 0), vm_read32(GCM_CONTROL_GUEST_ADDR + 4),
++                vm_read32(GCM_CONTROL_GUEST_ADDR + 8), s_fifo_getoff, (unsigned)s_flip_status);
++    }
++    return NULL;
++}
++#endif
++static void gcm_user_watch_start(void)
++{
++#ifndef _WIN32
++    static volatile int started = 0;
++    if (started) return;
++    started = 1;
++    if (!getenv("GCM_USER_WATCH")) return;
++    pthread_t t; if (pthread_create(&t, NULL, gcm_user_watch_main, NULL) == 0) pthread_detach(t);
++#endif
++}
++
+ void ppu_gcm_pump(void)
+ {
+     /* Every HLE call and timer sleep pumps, tens of thousands of times a
+@@ -967,7 +1030,8 @@ void ppu_gcm_pump(void)
+ #endif
+         return;   /* only the interrupt thread delivers */
+     }
+-    if (!GCM_PUMP_TRY_ENTER()) return;
++    if (!GCM_PUMP_TRY_ENTER()) { s_uw_busy++; return; }
++    s_uw_pumps++;
+     long p = (long)GCM_PENDING_TAKE();
+     u64 user = GCM_USER_PENDING_TAKE();
+     /* GCM_PUMP_DBG=1: how often each guest handler is actually delivered. */
+@@ -979,8 +1043,10 @@ void ppu_gcm_pump(void)
+                            calls, nv, nf, s_vblank_count, 10); } }
+     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
+         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
++        s_uw_in_handler = 1;
+         g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
+                            0, 0, 0, 0, 0, 0, 0);
++        s_uw_in_handler = 0;
+     }
+     if (p & 2) {
+         /* Delivery waits for a guest thread to reach an HLE call or a timer
+@@ -996,10 +1062,27 @@ void ppu_gcm_pump(void)
+         FLIP_UNLOCK();
+         if (s_flip_handler_opd && g_ps3_guest_caller) {
+             ydkj_restore_handler_opd(s_flip_handler_opd, s_flip_handler_code);
++            s_uw_in_handler = 2;
+             g_ps3_guest_caller(s_flip_handler_opd, 1, 0, 0, 0, 0, 0, 0, 0);
++            s_uw_in_handler = 0;
+         }
+     }
+-    if (user) {
++    if (gcm_user_cmd_queue_on()) {
++        /* One handler call per command, in FIFO order (see gcm_user_ring). */
++        unsigned drained = 0;
++        while (s_user_ring_tail != s_user_ring_head) {
++            u32 cmd = s_user_ring[s_user_ring_tail & (GCM_USER_RING - 1u)];
++            s_user_ring_tail++;
++            drained++;
++            s_uw_in_handler = 3;
++            if (s_user_handler_opd && g_ps3_guest_caller)
++                g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
++            s_uw_in_handler = 0;
++            s_uw_delivered++;
++        }
++        if (drained > 1) { static int n = 0; if (PS3_LOG_FIRST(n, 8))
++            fprintf(stderr, "[gcm] %u user commands were pending at one pump; each delivered\n", drained); }
++    } else if (user) {
+         u32 cmd = (u32)user;
+         if (s_user_handler_opd && g_ps3_guest_caller)
+             g_ps3_guest_caller(s_user_handler_opd, (uint64_t)cmd, 0, 0, 0, 0, 0, 0, 0);
+@@ -4853,7 +4937,21 @@ void cellGcmSetUserCommand(u32 cmd)
+  * Like the driver cause register, multiple pending commands coalesce. */
+ void cellGcmQueueUserCommand(u32 cmd)
+ {
++    gcm_user_watch_start();
++    s_uw_queued++;
+     GCM_USER_STORE(cmd);
++    if (gcm_user_cmd_queue_on()) {
++        if ((u32)(s_user_ring_head - s_user_ring_tail) < GCM_USER_RING) {
++            s_user_ring[s_user_ring_head & (GCM_USER_RING - 1u)] = cmd;
++#ifdef _WIN32
++            MemoryBarrier();
++#else
++            atomic_thread_fence(memory_order_seq_cst);
++#endif
++            s_user_ring_head++;
++        } else { static int n = 0; if (PS3_LOG_FIRST(n, 4))
++            fprintf(stderr, "[gcm] user command ring full, 0x%08X dropped\n", cmd); }
++    }
+     GCM_USER_PENDING_STORE((1ULL << 32) | cmd);
+ #ifdef _WIN32
+     gcm_pump_wake();
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index bb41b153..74c839ae 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -616,7 +616,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+     /* cri task (img22) atomic on the taskset: dump the loaded bitset line so we can
+      * see if the task reads MY taskset (0x4005E000) with my READY bit, or elsewhere. */
+     { static int s_ct=-1; if(s_ct<0) s_ct=getenv("SPU_ATOMTRACE")?1:0;
+-      if(s_ct && ctx->image_id==22 && cmd==0xD0 && mfc_ea_range_committed(ea,16)) {
++      if(s_ct && ctx->image_id==spu_cri_image() && cmd==0xD0 && mfc_ea_range_committed(ea,16)) {
+         static int _c=0; if(PS3_LOG_FIRST(_c, 24)){
+           uint8_t* m=vm_base+ea;
+           #define BW(o) (((uint32_t)m[o]<<24)|((uint32_t)m[o+1]<<16)|((uint32_t)m[o+2]<<8)|m[o+3])
+@@ -2402,7 +2402,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+      * woken). Honour the first call, halt on the rest. Each task runs on its own
+      * host thread, so a thread-local count is per task. */
+     static _Thread_local int s_exit_seen = 0;
+-    if (num == 0 && ctx->image_id == 22 && !getenv("YDKJ_CRI_EXIT_HALT")) {
++    if (num == 0 && ctx->image_id == spu_cri_image() && !getenv("YDKJ_CRI_EXIT_HALT")) {
+         if (s_exit_seen++ == 0) { ctx->gpr[3]._u32[0] = 0; return; }   /* bootstrap */
+         { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+             fprintf(stderr, "[spu] cri task EXIT #%d -- halting (was spinning)\n",
+@@ -2411,7 +2411,7 @@ void spu_spurs_taskset_syscall(spu_context* ctx)   /* non-static: also called by
+         spu_halt(ctx);
+         return;
+     }
+-    if (num == 0 && (ctx->image_id != 22 || getenv("YDKJ_CRI_EXIT_HALT"))) {
++    if (num == 0 && (ctx->image_id != spu_cri_image() || getenv("YDKJ_CRI_EXIT_HALT"))) {
+         ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+         spu_halt(ctx);          /* longjmp out to spu_run_with_halt; post-run writes exit code */
+         return;
+@@ -2833,7 +2833,7 @@ void spu_indirect_branch(spu_context* ctx)
+             (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
+             (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
+         int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
+-        if (ctx->image_id == 22 || standalone ||
++        if (ctx->image_id == spu_cri_image() || standalone ||
+             (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
+             spu_spurs_taskset_syscall(ctx);
+             ctx->pc = ctx->gpr[0]._u32[0] & SPU_LS_MASK;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index 400b2ba5..6459ad30 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -17,6 +17,24 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
++/* SPU_CRI_IMAGE=<id>: which lifted image is You Don't Know Jack's CRI movie
++ * task (cri_mpvps3spurs.elf). The runtime carries a dozen special cases for
++ * it -- its own SpursTasksetContext plant, exit handling, syscall routing --
++ * and they were all written against the literal image id 22, the slot that
++ * ELF has in that title. Image ids are just a title's embedded SPU ELFs in
++ * order, so in any other title image 22 is something else: in Asura's Wrath
++ * it is the PhysX task (spu_0021_at_018ECF00), which was handed the CRI
++ * context, read its queue and parameter EAs out of the wrong place (GETs from
++ * EA 0, GETLLAR spinning on 0x00400000) and never finished a simulation step,
++ * so the first map hung with the main thread waiting on physics. Default 22
++ * keeps that title as it was; 0 means "this title has no such image". */
++static inline int spu_cri_image(void)
++{
++    static int v = -1;
++    if (v < 0) { const char* e = getenv("SPU_CRI_IMAGE"); v = e ? atoi(e) : 22; }
++    return v;
++}
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 108e2694..6d5416ab 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -222,6 +222,23 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                               " size=%u covers 0x%08X\n",
+                       (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size,
+                       (uint32_t)s_w); } }
++    /* SPU_PUT_VALWATCH=<hex EA>: every PUT covering that word, with the 32-bit
++     * value it carries and what was there before. An address watch says who
++     * writes a counter; a counter that several jobs write only shows what went
++     * wrong once the VALUES are in order of arrival (a later job landing
++     * before an earlier one leaves it lower than its waiter needs). */
++    { static uint32_t s_vw = 1;
++      if (s_vw == 1) { const char* e = getenv("SPU_PUT_VALWATCH"); s_vw = e ? (uint32_t)strtoul(e, 0, 16) : 0; }
++      if (s_vw && mfc_is_put(cmd) && (uint32_t)ea <= s_vw && (uint32_t)ea + size >= s_vw + 4u) {
++          extern uint8_t* vm_base;
++          const uint8_t* src = spu->ls + ((lsa + (s_vw - (uint32_t)ea)) & SPU_LS_MASK);
++          const uint8_t* old = vm_base + s_vw;
++          static unsigned long _n = 0;
++          if (++_n <= 4000)
++              fprintf(stderr, "[put-val] #%lu img=%d spu=%X pc=0x%05X ea=0x%08X size=%u new=0x%02X%02X%02X%02X old=0x%02X%02X%02X%02X\n",
++                      _n, spu->image_id, spu->spu_id, (uint32_t)spu->pc & SPU_LS_MASK, (uint32_t)ea, size,
++                      src[0], src[1], src[2], src[3], old[0], old[1], old[2], old[3]);
++      } }
+     /* SPU_DMA_RANGE=<lo>-<hi> (hex EAs): log transfers touching [lo,hi), first
+      * 64 -- who reads or writes a buffer the RSX shares with the SPUs. */
+     { static uint32_t s_lo = 1, s_hi;
+@@ -494,7 +511,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+      * (large, from a non-context EA) as opposed to the 64-byte context handshake
+      * DMAs. Set a flag the dispatcher polls to know the task got real work. */
+     { extern int g_cri_video_dma;
+-      if (spu->image_id == 22 && mfc_is_get(cmd) && size > 0x100)
++      if (spu->image_id == spu_cri_image() && mfc_is_get(cmd) && size > 0x100)
+           g_cri_video_dma = 1; }
+     /* SPU_DSP_IMAGE_EA -- recover an SPU image load whose source address the
+      * title lost. You Don't Know Jack's FMOD mixer relocates a DSP plugin into
+@@ -1422,7 +1439,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+                            only==-3 ? "ALL images" : "one image id "
+                                                      "(a bare number is an IMAGE ID, not on/off)");
+         }
+-        if ((dt && (spu->image_id==22 || spu->image_id==23)) ||
++        if ((dt && (spu->image_id==spu_cri_image() || spu->image_id==23)) ||
+             only==-3 || (only >= 0 && spu->image_id == only)) {
+             static int _n=0; if (PS3_LOG_FIRST(_n, 160))
+                 fprintf(stderr, "[DMA] img%d cmd=0x%02X lsa=0x%05X ea=0x%09llX size=0x%X tag=%u\n",
+@@ -1642,7 +1659,7 @@ static inline int mfc_submit(mfc_engine* mfc, spu_context* spu, uint32_t cmd)
+      * can tell if eaContext holds valid SPURS work data or garbage. */
+     {
+         static int64_t dt2=-2; if (dt2==-2){ const char* e=getenv("SPU_DMATRACE_ALL"); dt2=e?1:0; }
+-        if (dt2 && spu->image_id==22 && cmd==0x40 /*GET*/ && size<=0x80) {
++        if (dt2 && spu->image_id==spu_cri_image() && cmd==0x40 /*GET*/ && size<=0x80) {
+             static int _g=0; if (PS3_LOG_FIRST(_g, 6)) {
+                 const uint8_t* p = spu->ls + (lsa & 0x3FFFF);
+                 fprintf(stderr, "[DMA] GET data @LS0x%05X (from ea=0x%09llX):", lsa, (unsigned long long)ea);
+diff --git a/runtime/spu/spu_interp.c b/runtime/spu/spu_interp.c
+index 6d63141f..522827c6 100644
+--- a/runtime/spu/spu_interp.c
++++ b/runtime/spu/spu_interp.c
+@@ -466,7 +466,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
+         if (ctx->pc == 0xA70u) {
+             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
+                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
+-            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
++            if (ctx->image_id == spu_cri_image() || (ctx->policy_mode && sc == 0xA70u)) {
+                 extern void spu_spurs_taskset_syscall(spu_context*);
+                 int _save = ctx->image_id; ctx->image_id = 22;
+                 spu_spurs_taskset_syscall(ctx);
+diff --git a/runtime/spu/spu_lifted_job.h b/runtime/spu/spu_lifted_job.h
+index 499f3a65..cfaf8cc8 100644
+--- a/runtime/spu/spu_lifted_job.h
++++ b/runtime/spu/spu_lifted_job.h
+@@ -226,7 +226,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+             ctx.gpr[3]._u32[2] = r3_override[2];   /* queue/lock EA            */
+             ctx.gpr[3]._u32[3] = r3_override[3];
+             if (!ctx.gpr[3]._u32[1]) ctx.gpr[3]._u32[1] = args_ea;
+-        } else if (image_id == 22) {
++        } else if (image_id == spu_cri_image()) {
+             /* cri_mpv leaf (func_00003E68) gate is `rotmai(r3.word0, 112) == 64`
+              * = an ARITHMETIC RIGHT-SHIFT BY 16 then ceqi 64, i.e. it wants
+              * (r3.word0 >> 16) == 0x40  ->  r3.word0 = 0x0040xxxx (0x40 in bits
+@@ -282,7 +282,7 @@ static inline int32_t spu_run_lifted_job_abi(spu_lifted_entry_fn entry,
+      * (planted by spurs_pm_build_context). Without it the leaf reads a garbage SPURS base
+      * and DMAs from a bad address / bails at init. Set for image 22 (cri) when the context
+      * carries a non-zero spurs ptr. */
+-    if (spurs_task_abi && (image_id == 22 || taskset_ctx)) {
++    if (spurs_task_abi && (image_id == spu_cri_image() || taskset_ctx)) {
+         uint32_t spurs_lo = _LB(0x2764);
+         if (spurs_lo) {
+             ctx.gpr[4]._u32[0] = _LB(0x2768);  /* args hi (d0) */
+diff --git a/runtime/spu/spu_workload.c b/runtime/spu/spu_workload.c
+index 803212b6..b7ff630b 100644
+--- a/runtime/spu/spu_workload.c
++++ b/runtime/spu/spu_workload.c
+@@ -654,7 +654,7 @@ static void spu_async_run(spu_async_job* j)
+      * back to a fresh per-dispatch LS when disabled / no taskset. */
+     spu_ts_ls_slot* ts_slot = NULL;
+     int did_load = 0;           /* whether THIS dispatch (re)loaded the image */
+-    if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != 22)
++    if (spu_persist_ls_enabled() && j->taskset_ea && j->image_id != spu_cri_image())
+         ts_slot = ts_ls_get(j->taskset_ea, j->taskid);
+     uint8_t* ls;
+     if (ts_slot) {
+@@ -691,7 +691,7 @@ static void spu_async_run(spu_async_job* j)
+              * the policy module (libsre @0x30021480 -> LS 0xA00) and write the
+              * task descriptor {0xFFFFFFFF, 0x400, 0x2700, 0x3000} at 0x2FB0, then
+              * run the cri task, to see how much further it gets. Diagnostic only. */
+-            if (j->image_id == 22 && ps3_env_once("YDKJ_CRI_TASKSET")) {
++            if (j->image_id == spu_cri_image() && ps3_env_once("YDKJ_CRI_TASKSET")) {
+                 /* cri build: load the TASKSET POLICY module (libsre 0x23680 ->
+                  * LS 0xA00) alongside the cri task (already at 0x3000), then RUN
+                  * THE POLICY ENTRY (tsp_spu_func_00000A00) under image 23. The
+@@ -735,7 +735,7 @@ static void spu_async_run(spu_async_job* j)
+              * trampoline (LS 0xA70, intercepted in spu_channels.c) + the task
+              * descriptor @0x2FB0. Adopted from JonathanDC64/ps3recomp (aaea4158).
+              * Gate: default on for image 22 unless YDKJ_NO_CRI_CTX. */
+-            if (j->image_id == 22 && !ps3_env_once("YDKJ_NO_CRI_CTX")) {
++            if (j->image_id == spu_cri_image() && !ps3_env_once("YDKJ_NO_CRI_CTX")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 extern uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
+                 #define LSBE32(o,v) do{uint32_t _v=(v);ls[(o)+0]=(uint8_t)(_v>>24);ls[(o)+1]=(uint8_t)(_v>>16);ls[(o)+2]=(uint8_t)(_v>>8);ls[(o)+3]=(uint8_t)_v;}while(0)
+@@ -794,7 +794,7 @@ static void spu_async_run(spu_async_job* j)
+              * (r3.word1 = args_ea). This is the job the game's cri_mpv PPU layer is
+              * supposed to populate (video-data EA, output buffer). If it's zero/garbage
+              * the PPU layer never wrote a real job -> the task decodes nothing. */
+-            if (j->image_id == 22 && j->args_ea) {
++            if (j->image_id == spu_cri_image() && j->args_ea) {
+                 extern uint8_t* vm_base;
+                 const uint8_t* c = vm_base + (j->args_ea & 0x0FFFFFFFu);
+                 fprintf(stderr, "[cri] eaContext=0x%08X 64B decode-context:", j->args_ea);
+@@ -821,7 +821,7 @@ static void spu_async_run(spu_async_job* j)
+              * buffer slightly LATER, delaying the run lets it see real data (=>
+              * timing bug, fix = defer/re-dispatch on signal); if it still loops on
+              * a null base, the buffer is never filled (=> an audio HLE gap). */
+-            if (j->image_id != 22) {
++            if (j->image_id != spu_cri_image()) {
+                 const char* d = ps3_env_once("LBP_TASK_DELAY");
+                 if (d && *d) {
+ #ifdef _WIN32
+@@ -839,7 +839,7 @@ static void spu_async_run(spu_async_job* j)
+              * Planting it makes the mixer read the real FMOD control block
+              * (0x0094F5xx) and the EventFlag handshake completes. Default ON;
+              * LBP_NO_TASKSET restores the old direct-dispatch for comparison. */
+-            if (j->image_id != 22 && !ps3_env_once("LBP_NO_TASKSET")) {
++            if (j->image_id != spu_cri_image() && !ps3_env_once("LBP_NO_TASKSET")) {
+                 extern uint64_t spurs_pm_build_context(uint8_t*, uint32_t, uint32_t, uint32_t, uint32_t);
+                 /* Use the taskset+taskid captured for THIS job at dispatch (not the
+                  * globals, which the next CreateTask clobbers -- the race that made
+@@ -944,7 +944,7 @@ static void spu_async_run(spu_async_job* j)
+              * in a bounded loop until it actually DECODES (a >256B video GET sets
+              * g_cri_video_dma) or we time out. This does NOT fake data: the task
+              * only decodes if the PPU genuinely populated real work meanwhile. */
+-            if (j->image_id == 22 && ps3_env_once("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
++            if (j->image_id == spu_cri_image() && ps3_env_once("YDKJ_CRI_RESUME") && !g_cri_video_dma) {
+                 for (int attempt = 0; attempt < 400 && !g_cri_video_dma; attempt++) {
+ #ifdef _WIN32
+                     Sleep(3);
+@@ -971,7 +971,7 @@ static void spu_async_run(spu_async_job* j)
+             /* YDKJ_CRI_WAKE probe: on cri task (image 22) completion, wake any PPU
+              * completion-waiter (the SPU->PPU cellSpursEventFlag completion isn't
+              * propagated yet). Tests whether the game then advances to draw content. */
+-            if (j->image_id == 22 && ps3_env_once("YDKJ_CRI_WAKE")) {
++            if (j->image_id == spu_cri_image() && ps3_env_once("YDKJ_CRI_WAKE")) {
+                 extern void ydkj_wake_all_event_flags(void);
+                 ydkj_wake_all_event_flags();
+                 fprintf(stderr, "[cri] YDKJ_CRI_WAKE: woke all event-flag waiters on cri completion\n");
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 464ff41b..6df718f2 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -4800,7 +4800,8 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                                 continue
+                             if count is None or _c > count:
+                                 count = _c
+-            if count is None or count < 0 or count > 4096:
++            _count_unknown = count is None or count < 0 or count > 4096
++            if _count_unknown:
+                 count = 256
+             # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
+             # counting: the backward window spans sibling basic blocks, so it can
+@@ -4840,7 +4841,20 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                 if table_base is None:
+                     continue
+                 targets = []
+-                for k in range(scan):
++                # No bound found and the table sits in the text segment: it is
++                # an inline table, placed directly before its cases, and the
++                # structural end below (cursor reaches the lowest forward case)
++                # finds its exact length, so the 256 guess must not cut it.
++                # Unoptimised code reloads the index from the stack between the
++                # bounds check and the shift (`cmplwi r0,0x174` ... `lwz
++                # r0,0x34(r31)` / `sldi r9,r0,2`), which defeats the register
++                # match above. Asura's Wrath func_00CD65CC is such a switch,
++                # 373 entries at 0x00CD6624: cases 256+ became unresolved
++                # indirect calls and the first map load ran on with garbage.
++                _scan = scan
++                if _count_unknown and text_lo <= table_base < text_hi:
++                    _scan = 4096
++                for k in range(_scan):
+                     ea = (table_base + k * 4) & 0xFFFFFFFF
+                     # Structural end-of-table: a jump table never overlaps the code
+                     # it dispatches to, so once the cursor reaches the lowest case

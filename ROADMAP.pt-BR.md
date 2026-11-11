@@ -336,17 +336,14 @@ rápida que attach de lldb num binário de 573 MB):
 - A thread "Bink IO" (entry OPD `0x01994498` → `func_01522008`) bloqueia em
   `sys_semaphore_wait` do semáforo `RADGAME` (sem=1):
   `func_01522008 → func_015149E8+3740 → func_0152161C+804 → sys_semaphore_wait`.
-- Os `semaphore_post(sem=1 'RADGAME')` param de vez na era do
-  `00_AUTOSAVE.BIK` (~23% do log). Depois disso nenhum vídeo (CAPCOMLOGO,
-  CC2LOGO, UE3LOGO, SPEEDTREELOGO, TITLEMENU_BG00) recebe post.
-- No período que funciona, cada post vem de um pop da fila SPURS
-  (`[asura queue] pop q=01B32980` → `semaphore_post`). Depois, zero pops.
-- **Zero bytes lidos de qualquer .BIK em todo o run.** A "animação" dos
-  primeiros ~40 s é UI do UE3, não vídeo; o `safe22` congelava no mesmo
-  ponto — os vídeos nunca animaram além do primeiro frame estático.
-- Suspeitos: as event queues 6/7 enchem (`port_send` → EBUSY) e ninguém as
-  drena; as threads receptoras esperam `sys_event_queue_receive` em filas
-  que nunca recebem. É o elo entre o fios e o Bink.
+- O log padrão limitava `semaphore_post` aos primeiros 40 registros e os pops
+  da fila SPURS aos primeiros 16; as conclusões sobre a parada definitiva de
+  posts e pops dependiam desse limite e foram corrigidas abaixo.
+- `sys_fs_read` não aparece no log padrão. A afirmação de zero bytes lidos de
+  `.BIK` foi refutada pelo trace de leitura abaixo.
+- As event queues 6/7 têm capacidade 1 e alguns `port_send` retornam EBUSY,
+  mas a fila 6 é consumida posteriormente. A fila 7 fica com um evento
+  pendente; ainda não há evidência de que isso bloqueie o vídeo.
 - O OOM dos ~290 s é **consequência** do congelamento: o jogo recria as
   tasks fios em loop de retry (CreateTask id 6.800+, ~10 alocações de 64 KB/s
   sem nenhum free — 2.932 até esgotar os 213 MB de memória de usuário).
@@ -355,3 +352,102 @@ O `tools/probe.sh` agora verifica o SIGKILL final: um probe do bink29
 terminou alegando ter parado e deixou o jogo órfão rodando (ainda escrevendo
 no mesmo log). Nenhum dado do jogo vai ao repositório (gitignore cobre
 `port/spu/` e os dumps).
+
+### Revisão do diagnóstico dos vídeos (probes `trace38` e `fs39`)
+
+`trace38` (75 s, `ASURA_QUEUE_LOG=500`) mostra os cinco workers FIOS
+continuando a devolver itens pelas filas SPURS até o limite configurado de
+500 transferências. A fila de eventos 6 também volta a ser consumida. Logo,
+o limite de logging anterior não pode ser usado como prova de que os workers
+ou as filas pararam. `RADGAME` é destruído e recriado com o mesmo ID entre
+vídeos; contar apenas posts por ID mistura instâncias diferentes.
+
+`fs39` (40 s, `FLOW_FSDBG=1 PS3_FSTRACE=1`) confirma leituras corretas do
+arquivo de vídeo: `00_AUTOSAVE.BIK` foi lido desde o cabeçalho até o offset
+393216 + 103572 bytes, `40_CAPCOMLOGO.BIK` e `40_CC2LOGO.BIK` tiveram dados
+de frame lidos, e `TITLEMENU_BG00.BIK` avançou da posição 0 até pelo menos
+2490368 + 131072 bytes. Cada `fread` visível devolveu a quantidade solicitada.
+A captura do probe mostra o logotipo SpeedTree renderizado. Em `trace38`, as
+capturas dos segundos 40 e 60 são idênticas (mesmo SHA-1), embora o renderizador
+tenha registrado novos frames até o número 1800. O `TITLEMENU_BG00.BIK` já foi
+aberto quando a tela ainda exibe SpeedTree. O problema atual está **depois da
+leitura inicial**, possivelmente na decodificação/apresentação dos frames ou na
+sincronização com o menu; isso ainda precisa ser isolado.
+O vídeo do menu e a resposta ao controle não foram verificados como funcionais.
+
+`sem40` (65 s, `SEMTID=1`) registrou 319 chamadas de
+`semaphore_post(sem=1)` ao longo da introdução, principalmente da thread PPU
+22. Portanto, os posts não param no primeiro vídeo. Após abrir
+`TITLEMENU_BG00.BIK`, houve posts das threads 1 e 22; o último registro desse
+probe foi na linha 43350. As capturas de 45 e 60 s são idênticas, embora
+continuem sendo produzidos flips. O próximo trace deve correlacionar o último
+post do título com a saída do job de vídeo e o buffer apresentado, sem usar
+o semáforo da introdução como causa presumida.
+
+### Continuação: overlay SPU e pressão de memória (`job41`–`resume51`)
+
+`job41` mostrou que a imagem SPU 1 salta para código carregado em tempo de
+execução em LS `0x21D20` e `0x37348` durante a abertura do título. O dump de
+256 KiB de LS (`ls42`) confirmou instruções nesses endereços, fora do `.text`
+da imagem extraída. O filtro opcional `SPU_LS_DUMP_IMG` permite capturar uma
+imagem específica. Com `SPU_INTERP_UNLIFTED=1`, o interpretador executa esses
+trechos, mas o menu continua parado. O caminho que retorna do interpretador
+agora despacha a função recompilada encontrada; `resume51` confirmou que essa
+correção isolada também não libera o menu.
+
+`mem45`–`chain47` identificaram a thread PPU 19 (`CellMemoryManager`) pedindo
+páginas de 64 KiB através de `func_0089A0F8`; a cadeia de chamadas passa por
+`func_00A7901C`. Em `mem256_50`, um limite experimental de 256 MiB foi todo
+consumido e a alocação seguinte falhou exatamente como no limite padrão de
+213 MiB. O aumento de limite foi removido: a falta de memória é o resultado
+das tentativas repetidas de criar tasks durante a parada, não uma solução para
+ela. As consultas de tamanho de memória não foram chamadas nos probes.
+
+`resume51` abriu `TITLEMENU_BG00.BIK`, mas as capturas de 40, 60 e 80 s têm
+SHA-1 idêntico. A task SPU MultiStream terminou após `ShutdownTaskset()` e
+registrou a assertiva de inicialização. A gameplay **ainda não foi alcançada**.
+O próximo diagnóstico deve ligar a conclusão das tasks de vídeo à produção e
+apresentação do primeiro frame do Bink do menu, observando a fila de eventos,
+o semáforo `RADGAME` e o destino dos buffers de vídeo no mesmo intervalo.
+
+### Continuação (10–11/11): do título travado à gameplay do Episódio 1
+
+**Estado:** o probe `play79` (470 s, sem janela, input por roteiro) passa pelo
+título, cria/carrega o save, entra em NEW GAME, toca a abertura do Episódio 1,
+abre o menu de pausa com START e chega aos primeiros QTEs (ícones L/R) sem
+nenhum erro no log. Não verificado: áudio, a resposta aos QTEs, o restante do
+episódio e a execução em janela depois destas correções.
+
+Cinco causas, na ordem em que apareceram:
+
+1. **Título congelado (sempre).** O runtime injetava um evento "job N
+   concluído" por job SPURS em toda fila anexada. A fila 5 é do alocador em
+   blocos do jogo (thread `CellMemoryManager`, `func_00A7901C`), que lê o dado
+   como "aloque mais 32 KB para o slot N": 2.900 blocos, 213 MB, e o tratador
+   de OOM do UE3 parava segurando a trava do alocador.
+   `SPURS_JC_EVENT_FROM_JOB=1`.
+2. **Congelamento intermitente (3 em 10 boots).** O chain "ShaderPatching"
+   (`0x01A96980`) é só de acréscimo; cada `cellSpursRunJobChain` recomeçava do
+   início e reexecutava todos os jobs, e o contador em `0x01A96900` que a
+   thread de renderização espera (`func_008736F8`) varria 1..N a cada chamada.
+   `SPURS_JG_WAIT_FOREVER=1`.
+3. **SIGBUS ao carregar o Episódio 1.** O `switch` de 373 casos de
+   `func_00CD65CC` era cortado em 256 pelo lifter; o caso 0x121 virava
+   "unresolved indirect call". Corrigido no lifter; só `ppu_recomp_006.cpp`
+   mudou.
+4. **Parada logo após o mapa e o HUD.** Os casos especiais da task CRI de
+   outro título usam o id de imagem 22, que aqui é a task de PhysX; ela lia
+   parâmetros do EA 0 e girava num GETLLAR em `0x00400000`.
+   `SPU_CRI_IMAGE=0`.
+5. **Probes imprevisíveis.** O controle físico conectado mexia nos menus
+   entre os botões do roteiro. `PAD_NO_CONTROLLER=1` em `tools/probe.sh`.
+
+Os quatro primeiros são padrões do título em `port/main.cpp`; as mudanças do
+toolkit estão em `patches/ps3recomp-asura-gameplay.patch`.
+
+Em aberto: o áudio (a task MultiStream executa o codec `flashMP3.pic`
+carregado em tempo de execução pelo interpretador e rejeita transferências de
+tamanho 0); `cellSpursQueueDetachLv2EventQueue` sem implementação;
+`GCM_USER_CMD_QUEUE=1` ficou ligado sem ter sido a causa de nada (hipótese
+não confirmada); e o relato de "tela cortando" no menu em janela, que as
+capturas sem janela não mostram.

@@ -35,6 +35,12 @@ com o jogo — veja [docs/DLC.md](docs/DLC.md).
 > sem afiliação com a Capcom, a CyberConnect2 ou a Sony Interactive
 > Entertainment.
 
+## Metadados do projeto
+
+Os metadados do projeto para catálogos e ferramentas ficam em [`.recomp.json`](.recomp.json),
+conforme a [especificação do recomp.board](https://recomp.fyi/spec). Mantenha o arquivo
+atualizado quando mudar o estado do projeto, a versão do jogo suportada ou as plataformas de destino.
+
 ## Como se constrói
 
 Pré-requisitos: o disco (ISO) em `~/Downloads` (ou ajuste o symlink

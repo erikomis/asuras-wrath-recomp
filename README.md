@@ -36,6 +36,12 @@ and play has not been tried yet.
 > packages stay encrypted with the buyer's licence). A fan project, not
 > affiliated with Capcom, CyberConnect2 or Sony Interactive Entertainment.
 
+## Project metadata
+
+Project metadata for directories and tools lives in [`.recomp.json`](.recomp.json),
+following the [recomp.board specification](https://recomp.fyi/spec). Keep it
+updated when the project status, supported game version or target platforms change.
+
 ## Building
 
 Prerequisites: the disc (ISO) in `~/Downloads` (or adjust the `game_iso`

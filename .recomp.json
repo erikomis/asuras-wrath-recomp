@@ -1,0 +1,16 @@
+{
+  "$schema": "https://recomp.fyi/schema/v1.json",
+  "game": "Asura's Wrath",
+  "system": "PS3",
+  "type": "recomp",
+  "original": {
+    "serial": "BLUS30721",
+    "revision": "01.02"
+  },
+  "status": "in-progress",
+  "targets": [
+    "macOS"
+  ],
+  "toolchain": "ps3recomp",
+  "notes": "Source-only early alpha for Apple silicon Macs. Headless probes reach Episode 1 and its first QTEs; audio does not work, and windowed play and later episodes remain unverified."
+}

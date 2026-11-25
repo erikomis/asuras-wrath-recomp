@@ -1,0 +1,551 @@
+From f87d3ca160f04bc58c7dbac1f43c031a7082a4c3 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:18:52 +0200
+Subject: [PATCH] SPU GETLLAR snapshots are atomic; texture eviction; Linux
+ write tracking
+
+GETLLAR's lock-free fast path copied the 128-byte line without checking for
+a writer, so a PPU store landing mid-copy gave the SPURS kernel a torn
+control block and it halted on its own consistency assert (the gameplay
+freeze). The line lock now carries a sequence count (odd while a writer is
+inside); the fast path copies, revalidates, and recopies under the lock if a
+writer overlapped. New stress test test_spu_getllar_snapshot reproduces the
+tear (thousands per run before, none after).
+
+Textures unused for 1800 flips are evicted every 256 flips through the
+deferred-destroy list. Texture change detection is one path for both
+platforms with a per-platform page scan: GetWriteWatch on Windows,
+asynchronous userfaultfd write-protection with PAGEMAP_SCAN on Linux (which
+also sees writes made by system calls). Linux guest memory is a page-aligned
+MAP_NORESERVE reservation like the Windows reserve.
+---
+ .github/workflows/linux.yml                   |   2 +-
+ libs/video/vk/vk_renderer.cpp                 |   9 +
+ libs/video/vk/vk_renderer.h                   |   3 +-
+ libs/video/vk/vk_texture.cpp                  |  98 ++++++++---
+ runtime/spu/spu_channels.c                    |  27 +--
+ runtime/spu/spu_coherency.c                   |  38 +++--
+ runtime/spu/tests/test_spu_getllar_snapshot.c | 159 ++++++++++++++++++
+ runtime/spu/tests/test_spu_lockline_peer.c    |   9 +-
+ tools/test_spu_context_registries.py          |   2 +-
+ 9 files changed, 283 insertions(+), 64 deletions(-)
+ create mode 100644 runtime/spu/tests/test_spu_getllar_snapshot.c
+
+diff --git a/.github/workflows/linux.yml b/.github/workflows/linux.yml
+index cf0f7417..538f25aa 100644
+--- a/.github/workflows/linux.yml
++++ b/.github/workflows/linux.yml
+@@ -142,7 +142,7 @@ jobs:
+         run: |
+           $CC -std=gnu17 -I include -I runtime/spu -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
+           /tmp/test_spu_coherency
+-          for t in test_spu_lockline_peer test_spu_mfc_slots; do
++          for t in test_spu_lockline_peer test_spu_getllar_snapshot test_spu_mfc_slots; do
+             $CC -std=gnu17 -I include -I runtime/spu -I runtime/platform -o /tmp/$t \
+               runtime/spu/tests/$t.c \
+               runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
+diff --git a/libs/video/vk/vk_renderer.cpp b/libs/video/vk/vk_renderer.cpp
+index 3c249cc9..789d4791 100644
+--- a/libs/video/vk/vk_renderer.cpp
++++ b/libs/video/vk/vk_renderer.cpp
+@@ -917,6 +917,15 @@ void renderer::flip_reset()
+     end_rendering();
+     frontend::reset();
+     m_fb_valid = false;
++    if ((++m_flips & 255u) == 0)
++        for (auto it = m_textures.begin(); it != m_textures.end();) {
++            if (m_flips - it->second->used <= 1800u) {
++                ++it;
++                continue;
++            }
++            m_garbage.emplace_back(*m_submitted + 1u, it->second->img);
++            it = m_textures.erase(it);
++        }
+ }
+ 
+ }
+diff --git a/libs/video/vk/vk_renderer.h b/libs/video/vk/vk_renderer.h
+index 59693553..bb1be230 100644
+--- a/libs/video/vk/vk_renderer.h
++++ b/libs/video/vk/vk_renderer.h
+@@ -170,7 +170,7 @@ private:
+         image img;
+         u32 stamp = 0;
+         u64 checked = 0;
+-        uint64_t content = 0;
++        u64 used = 0;
+     };
+     struct unit_binding {
+         bool valid = false;
+@@ -192,6 +192,7 @@ private:
+     std::vector<u32> m_page_stamp;
+     u32 m_stamp = 1;
+     u64 m_epoch = 1;
++    u64 m_flips = 0;
+     std::vector<rsx::texture_copy> m_copies;
+ 
+ public:
+diff --git a/libs/video/vk/vk_texture.cpp b/libs/video/vk/vk_texture.cpp
+index 733dfa61..db5934b0 100644
+--- a/libs/video/vk/vk_texture.cpp
++++ b/libs/video/vk/vk_texture.cpp
+@@ -7,6 +7,13 @@
+ 
+ #ifdef _WIN32
+ #include <windows.h>
++#else
++#include <fcntl.h>
++#include <linux/fs.h>
++#include <linux/userfaultfd.h>
++#include <sys/ioctl.h>
++#include <sys/syscall.h>
++#include <unistd.h>
+ #endif
+ 
+ namespace vk {
+@@ -31,6 +38,69 @@ u32 texel_bytes(VkFormat f)
+     }
+ }
+ 
++#ifdef _WIN32
++bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
++{
++    thread_local std::vector<PVOID> pages(1u << 16);
++    for (;;) {
++        ULONG_PTR count = pages.size();
++        DWORD granularity = 0;
++        if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, vm_base + base, bytes, pages.data(), &count, &granularity) != 0) return false;
++        if (count) {
++            const u32 s = ++clock;
++            for (ULONG_PTR i = 0; i < count; i++) stamps[(u32)(static_cast<uint8_t*>(pages[i]) - vm_base) >> k_page_shift] = s;
++        }
++        if (count < pages.size()) return true;
++    }
++}
++#else
++struct write_tracker {
++    int uffd = -1;
++    int pagemap = -1;
++    bool ok = false;
++
++    write_tracker()
++    {
++        constexpr uint64_t span = 1ull << 32;
++        uffd = (int)syscall(__NR_userfaultfd, O_CLOEXEC | O_NONBLOCK);
++        if (uffd < 0) return;
++        uffdio_api api{ UFFD_API, UFFD_FEATURE_WP_ASYNC | UFFD_FEATURE_WP_UNPOPULATED, 0 };
++        uffdio_register reg{ { (uintptr_t)vm_base, span }, UFFDIO_REGISTER_MODE_WP, 0 };
++        uffdio_writeprotect wp{ { (uintptr_t)vm_base, span }, UFFDIO_WRITEPROTECT_MODE_WP };
++        if (ioctl(uffd, UFFDIO_API, &api) || ioctl(uffd, UFFDIO_REGISTER, &reg) || ioctl(uffd, UFFDIO_WRITEPROTECT, &wp)) return;
++        pagemap = open("/proc/self/pagemap", O_RDONLY | O_CLOEXEC);
++        ok = pagemap >= 0;
++    }
++};
++
++bool scan_writes(u32 base, u32 bytes, std::vector<u32>& stamps, u32& clock)
++{
++    static const write_tracker tracker;
++    if (!tracker.ok) return false;
++    page_region regions[32];
++    pm_scan_arg arg{};
++    arg.size = sizeof arg;
++    arg.flags = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
++    arg.start = (uintptr_t)(vm_base + base);
++    arg.end = arg.start + bytes;
++    arg.vec = (uintptr_t)regions;
++    arg.vec_len = 32;
++    arg.category_mask = PAGE_IS_WRITTEN;
++    arg.return_mask = PAGE_IS_WRITTEN;
++    for (;;) {
++        const long n = ioctl(tracker.pagemap, PAGEMAP_SCAN, &arg);
++        if (n < 0) return false;
++        if (n) {
++            const u32 s = ++clock;
++            for (long i = 0; i < n; i++)
++                for (uint64_t a = regions[i].start; a < regions[i].end; a += 1u << k_page_shift)
++                    stamps[(u32)(a - (uintptr_t)vm_base) >> k_page_shift] = s;
++        }
++        if (arg.walk_end >= arg.end) return true;
++        arg.start = arg.walk_end;
++    }
++}
++#endif
+ uint64_t mix(uint64_t h, uint64_t v)
+ {
+     h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+@@ -65,37 +135,13 @@ void renderer::mark_written(u32 ea, u32 size)
+ 
+ bool renderer::memory_changed(u32 ea, u32 size, u32 stamp)
+ {
+-#ifdef _WIN32
+     if (m_page_stamp.empty()) m_page_stamp.assign(1u << (32 - k_page_shift), 0u);
+-    static thread_local std::vector<PVOID> pages(1u << 16);
+-    auto scan = [&](u32 base, u32 bytes) {
+-        for (;;) {
+-            ULONG_PTR count = pages.size();
+-            DWORD granularity = 0;
+-            if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, vm_base + base, bytes, pages.data(), &count, &granularity) != 0) return false;
+-            if (count) {
+-                const u32 s = ++m_stamp;
+-                for (ULONG_PTR i = 0; i < count; i++) {
+-                    const uint64_t page = (uint64_t)(static_cast<uint8_t*>(pages[i]) - vm_base) >> k_page_shift;
+-                    if (page < m_page_stamp.size()) m_page_stamp[page] = s;
+-                }
+-            }
+-            if (count < pages.size()) return true;
+-        }
+-    };
+     const u32 mask = (1u << k_page_shift) - 1u;
+-    if (!scan(ea & ~mask, ((ea & mask) + size + mask) & ~mask)) return true;
++    if (!scan_writes(ea & ~mask, ((ea & mask) + size + mask) & ~mask, m_page_stamp, m_stamp)) return true;
+     for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift; p++)
+         if (m_page_stamp[p] > stamp) return true;
+     return false;
+-#else
+-    if (m_page_stamp.empty()) return false;
+-    for (uint64_t p = ea >> k_page_shift; p <= ((uint64_t)ea + size - 1u) >> k_page_shift && p < m_page_stamp.size(); p++)
+-        if (m_page_stamp[p] > stamp) return true;
+-    return false;
+-#endif
+ }
+-
+ VkImageView renderer::view_for(image& img, VkImageViewType type, VkFormat format, VkImageAspectFlags aspect, const VkComponentMapping& swizzle)
+ {
+     const uint64_t key = swizzle_key(type, format, aspect, swizzle);
+@@ -318,11 +364,13 @@ bool renderer::resolve_texture(u32 unit, bool vertex, VkDescriptorImageInfo& out
+     const uint64_t key = texture_key(d, ea);
+     auto it = m_textures.find(key);
+     texture_entry* e = it != m_textures.end() ? it->second.get() : nullptr;
++    if (e) e->used = m_flips;
+     bool upload = false;
+     if (!e) {
+         auto made = std::make_unique<texture_entry>();
+         e = made.get();
+         e->ea = ea;
++        e->used = m_flips;
+         e->size = d.guest_size;
+         e->key = key;
+         VkImageCreateInfo ii{ VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 3b4a6e1c..f643e070 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -456,33 +456,20 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * policy-module poll -- publishes its reservation and copies without
+          * the lock; any write the copy misses ends that reservation (see
+          * spu_coh_reserve_fast). Anything else takes the lock as before. */
+-        const int llar_fast = spu_coh_reserve_fast(ctx, ea);
++        uint32_t llar_seq;
++        int llar_fast = spu_coh_reserve_fast(ctx, ea, &llar_seq);
++        if (llar_fast) {
++            memcpy(ls, mem, MFC_ATOMIC_LINE);
++            llar_fast = spu_lockline_unchanged(llar_seq);
++        }
+         if (!llar_fast) {
+             spu_lockline_lock();
+             /* Tell the PPU store paths this line is live, so a store into it goes
+              * through the lock and raises SPU_EVENT_LR here instead of landing
+              * unannounced. Nothing else about this transaction changes. */
+             spu_coh_reserve(ctx, ea);
++            memcpy(ls, mem, MFC_ATOMIC_LINE);
+         }
+-
+-        /* ONE read of guest memory, then the snapshot from that copy.
+-         *
+-         * This used to memcpy from `mem` twice -- once to the local store, once
+-         * to resv_line -- and a PPU store landing BETWEEN the two reads gave the
+-         * SPU a stale line and a fresh snapshot. That is a permanent deadlock,
+-         * and it is the one this port spent a session chasing: the SPU compares
+-         * its (stale) copy, finds produced == consumed, and sleeps on
+-         * MFC_LLR_LOST_EVENT; spu_resv_lost_poll then compares memory against a
+-         * snapshot that ALREADY has the new value, finds no difference, and
+-         * never raises the event. Measured at a freeze: mirror 0x9E, snapshot
+-         * 0x9F, memory 0x9F, and the SPU polling rchcnt 1.6 billion times.
+-         *
+-         * Hardware cannot produce that state: GETLLAR is a single atomic
+-         * 128-byte read, so the reserved data and the reservation come from the
+-         * same instant. Copying the snapshot from `ls` restores that property,
+-         * and a store that lands after the read now leaves BOTH stale -- which
+-         * is what makes the lost-reservation event fire. */
+-        memcpy(ls, mem, MFC_ATOMIC_LINE);              /* line -> local store */
+         /* Snapshot from `ls`, NOT a second read of `mem`. Hardware GETLLAR is a
+          * single atomic 128-byte read, so the reserved data and the reservation
+          * come from the same instant. Reading guest memory twice lets a PPU store
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 8fec9875..cbcb8b22 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -25,9 +25,23 @@ extern "C" {
+ 
+ #include "../platform/ps3_sync.h"
+ 
+-static ps3_lock g_lockline;
+-void spu_lockline_lock(void)   { ps3_lock_acquire(&g_lockline); }
+-void spu_lockline_unlock(void) { ps3_lock_release(&g_lockline); }
++static struct { ps3_lock lock; uint32_t seq; } g_lockline;
++void spu_lockline_lock(void)
++{
++    ps3_lock_acquire(&g_lockline.lock);
++    __atomic_store_n(&g_lockline.seq, g_lockline.seq + 1, __ATOMIC_RELAXED);
++    __atomic_thread_fence(__ATOMIC_RELEASE);
++}
++void spu_lockline_unlock(void)
++{
++    __atomic_store_n(&g_lockline.seq, g_lockline.seq + 1, __ATOMIC_RELEASE);
++    ps3_lock_release(&g_lockline.lock);
++}
++int spu_lockline_unchanged(uint32_t seq)
++{
++    __atomic_thread_fence(__ATOMIC_ACQUIRE);
++    return __atomic_load_n(&g_lockline.seq, __ATOMIC_RELAXED) == seq;
++}
+ 
+ /* ===========================================================================
+  * The reserved-line bitmap
+@@ -232,13 +246,9 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
+  * store and the load on both sides, the two fences are ordered, so at least
+  * one side sees the other. Either the reader's copy already holds the write
+  * (an ordinary GETLLAR after the store), or the writer sees the reservation
+- * and ends it -- the reader may then hold a stale or torn copy, but its
+- * PUTLLC fails and it has SPU_EVENT_LR, exactly as for a write landing just
+- * after a locked GETLLAR. A writer that loads stale resv_valid/resv_ea is one
+- * whose fence came first, so the copy already holds its data; at worst it
+- * ends the new reservation spuriously. What the reader gives up is a copy
+- * atomic against a writer's multi-store critical section, but such a copy is
+- * always followed by that writer's notify, so the reservation is ended.
++ * and ends it. A writer that loads stale resv_valid/resv_ea is one whose fence
++ * came first, so the copy already holds its data; at worst it ends the new
++ * reservation spuriously.
+  *
+  * Two preconditions keep every writer of the line on that right-hand side:
+  *  - the line is already marked. Marks are never cleared, so every store path
+@@ -249,8 +259,7 @@ __attribute__((weak)) void ppu_resv_break_line(uint32_t ea) { (void)ea; }
+  * Anything else takes the lock and spu_coh_reserve as before.
+  *
+  * Writers still hold the lock-line lock, so they stay serialized with each
+- * other and with PUTLLC's compare-and-commit; only the reader stopped
+- * waiting. resv_valid and resv_ea are accessed atomically on both sides of
++ * other and with PUTLLC's compare-and-commit. resv_valid and resv_ea are accessed atomically on both sides of
+  * the race; everything else about a reservation is still only touched by the
+  * owning thread or under the lock.
+  * ===========================================================================*/
+@@ -262,7 +271,7 @@ static inline int spu_coh_holds(const spu_context* c, uint32_t line)
+            (__atomic_load_n(&c->resv_ea, __ATOMIC_RELAXED) & ~127u) == line;
+ }
+ 
+-int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
++int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq)
+ {
+     if (!ctx || !__atomic_load_n(&ctx->coh_listed, __ATOMIC_RELAXED) ||
+         !spu_coh_is_reserved(ea))
+@@ -273,7 +282,8 @@ int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea)
+     __atomic_store_n(&ctx->resv_ea, ea, __ATOMIC_RELAXED);
+     __atomic_store_n(&ctx->resv_valid, 1, __ATOMIC_RELAXED);
+     __atomic_thread_fence(__ATOMIC_SEQ_CST);
+-    return 1;
++    *seq = __atomic_load_n(&g_lockline.seq, __ATOMIC_ACQUIRE);
++    return !(*seq & 1u);
+ }
+ 
+ void spu_coh_notify_write_except(uint32_t ea, const void* self)
+diff --git a/runtime/spu/tests/test_spu_getllar_snapshot.c b/runtime/spu/tests/test_spu_getllar_snapshot.c
+new file mode 100644
+index 00000000..0c9d1f93
+--- /dev/null
++++ b/runtime/spu/tests/test_spu_getllar_snapshot.c
+@@ -0,0 +1,159 @@
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++static uint8_t g_guest_mem[1u << 20];
++uint8_t* vm_base = g_guest_mem;
++uint32_t ppu_vm_size = 0;
++
++#include "../spu_channels.c"
++#include "../../ppu/ppu_memory.h"
++
++#define LINE        0x00020000u
++#define LSA         0x00001000u
++#define READERS     3
++#define READS       400000
++#define PPU_WRITERS 2
++#define RUN         6
++
++static spu_context g_reader[READERS];
++static spu_context g_spu_writer;
++static atomic_int g_stop;
++static atomic_ulong g_torn, g_reads, g_spu_commits;
++
++static void wrch(spu_context* ctx, uint32_t channel, uint32_t v)
++{
++    spu_wrch(ctx, channel, spu_make_preferred_u32(v));
++}
++
++static void spu_atomic(spu_context* ctx, uint32_t ea, uint32_t cmd)
++{
++    wrch(ctx, MFC_LSA, LSA);
++    wrch(ctx, MFC_EAH, 0);
++    wrch(ctx, MFC_EAL, ea);
++    wrch(ctx, MFC_Cmd, cmd);
++}
++
++static uint64_t be64(const uint8_t* p)
++{
++    uint64_t v;
++    memcpy(&v, p, 8);
++    return __builtin_bswap64(v);
++}
++
++static void put_be64(uint8_t* p, uint64_t v)
++{
++    v = __builtin_bswap64(v);
++    memcpy(p, &v, 8);
++}
++
++static int run_consistent(const uint8_t* line, unsigned first)
++{
++    const uint64_t head = be64(line + first * 8u);
++    uint64_t prev = head;
++    for (unsigned i = first + 1; i < first + RUN; i++) {
++        const uint64_t v = be64(line + i * 8u);
++        if (v > prev) return 0;
++        prev = v;
++    }
++    return head - prev <= 1;
++}
++
++static int snapshot_consistent(const uint8_t* line)
++{
++    for (unsigned w = 0; w < PPU_WRITERS; w++)
++        if (!run_consistent(line, w * RUN)) return 0;
++    for (unsigned i = PPU_WRITERS * RUN; i < 16u; i++)
++        if (be64(line + i * 8u) != be64(line + PPU_WRITERS * RUN * 8u)) return 0;
++    return 1;
++}
++
++static void* ppu_writer(void* arg)
++{
++    const unsigned first = (unsigned)(uintptr_t)arg * RUN;
++    for (uint64_t n = 1; !atomic_load_explicit(&g_stop, memory_order_relaxed); n++)
++        for (unsigned i = first; i < first + RUN; i++)
++            vm_write64(LINE + i * 8u, n);
++    return NULL;
++}
++
++static void* spu_writer(void* arg)
++{
++    (void)arg;
++    spu_context* ctx = &g_spu_writer;
++    while (!atomic_load_explicit(&g_stop, memory_order_relaxed)) {
++        spu_atomic(ctx, LINE, MFC_GETLLAR_CMD);
++        uint8_t* ls = &ctx->ls[LSA];
++        const uint64_t n = be64(ls + PPU_WRITERS * RUN * 8u) + 1;
++        for (unsigned i = PPU_WRITERS * RUN; i < 16u; i++) put_be64(ls + i * 8u, n);
++        spu_atomic(ctx, LINE, MFC_PUTLLC_CMD);
++        if (ctx->atomic_stat == 0) atomic_fetch_add(&g_spu_commits, 1);
++    }
++    return NULL;
++}
++
++static void* reader(void* arg)
++{
++    spu_context* ctx = (spu_context*)arg;
++    unsigned long torn = 0;
++    for (int k = 0; k < READS; k++) {
++        spu_atomic(ctx, LINE, MFC_GETLLAR_CMD);
++        if (!snapshot_consistent(&ctx->ls[LSA])) torn++;
++    }
++    atomic_fetch_add(&g_torn, torn);
++    atomic_fetch_add(&g_reads, READS);
++    return NULL;
++}
++
++int main(void)
++{
++    memset(g_guest_mem + LINE, 0, 128);
++    spu_context_init(&g_spu_writer, 0);
++    g_spu_writer.spu_id = READERS;
++    spu_atomic(&g_spu_writer, LINE, MFC_GETLLAR_CMD);
++    for (int i = 0; i < READERS; i++) {
++        spu_context_init(&g_reader[i], 0);
++        g_reader[i].spu_id = (uint32_t)i;
++        spu_atomic(&g_reader[i], LINE, MFC_GETLLAR_CMD);
++    }
++
++    pthread_t w[PPU_WRITERS + 1], r[READERS];
++    for (int i = 0; i < PPU_WRITERS; i++)
++        if (pthread_create(&w[i], NULL, ppu_writer, (void*)(uintptr_t)i)) return 2;
++    if (pthread_create(&w[PPU_WRITERS], NULL, spu_writer, NULL)) return 2;
++    for (int i = 0; i < READERS; i++)
++        if (pthread_create(&r[i], NULL, reader, &g_reader[i])) return 2;
++    for (int i = 0; i < READERS; i++) pthread_join(r[i], NULL);
++    atomic_store(&g_stop, 1);
++    for (int i = 0; i <= PPU_WRITERS; i++) pthread_join(w[i], NULL);
++
++    const unsigned long torn = atomic_load(&g_torn);
++    const int ok = torn == 0 && snapshot_consistent(g_guest_mem + LINE) &&
++                   be64(g_guest_mem + LINE) > 0 && atomic_load(&g_spu_commits) > 0;
++    printf("GETLLAR snapshot atomicity: %lu reads, %lu torn, %lu SPU commits, line %llu/%llu/%llu: %s\n",
++           atomic_load(&g_reads), torn, atomic_load(&g_spu_commits),
++           (unsigned long long)be64(g_guest_mem + LINE),
++           (unsigned long long)be64(g_guest_mem + LINE + RUN * 8u),
++           (unsigned long long)be64(g_guest_mem + LINE + PPU_WRITERS * RUN * 8u),
++           ok ? "PASS" : "FAIL");
++    return ok ? 0 : 1;
++}
++
++void ppu_resv_break_store(uint64_t ea)                 { (void)ea; }
++void ps3_ww_report_inline(uint32_t a, uint64_t v, int w)
++{
++    (void)a; (void)v; (void)w;
++}
++unsigned long long ps3_ms_now(void)                    { return 0; }
++uint32_t g_ww_lo = 0xFFFFFFFFu, g_ww_hi = 0;
++int      g_resv_store_active = 0;
++uint32_t g_barrier_sync_watch = 0;
++
++void (*g_spurs_kernel_hook)(uint32_t) = 0;
++void spurs_ef_set_from_spu(uint32_t ea, uint16_t bits) { (void)ea; (void)bits; }
++
++uint32_t g_spu_image_src_ea, g_spu_image_ls_start, g_spu_image_span;
++void spu_thread_publish_ctx(uint32_t tid, void* ctx) { (void)tid; (void)ctx; }
+diff --git a/runtime/spu/tests/test_spu_lockline_peer.c b/runtime/spu/tests/test_spu_lockline_peer.c
+index 0a2aed1e..5163578a 100644
+--- a/runtime/spu/tests/test_spu_lockline_peer.c
++++ b/runtime/spu/tests/test_spu_lockline_peer.c
+@@ -316,8 +316,13 @@ static void test_registered_getllar_skips_the_lock(void)
+     spu_atomic(&g_a, LSA_A, LINE_A, MFC_GETLLAR_CMD);   /* registers, marks */
+     g_guest_mem[LINE_A + 5] = 0x77;
+ 
+-    TEST("a registered holder's GETLLAR of a marked line does not wait for the lock");
+-    CHECK(llar_completes_under_held_lock(LINE_A) == 1);
++    TEST("a registered holder's GETLLAR of a marked line skips the lock when no writer holds it");
++    uint32_t seq;
++    CHECK(spu_coh_reserve_fast(&g_a, LINE_A, &seq) == 1);
++    CHECK(spu_lockline_unchanged(seq));
++
++    TEST("...and waits out a writer's open critical section instead of copying through it");
++    CHECK(llar_completes_under_held_lock(LINE_A) == 0);
+     CHECK(g_a.resv_valid == 1);
+     CHECK_EQ_U32(g_a.resv_ea, LINE_A);
+     CHECK_EQ_U32(g_a.ls[LSA_A + 5], 0x77);
+diff --git a/tools/test_spu_context_registries.py b/tools/test_spu_context_registries.py
+index f7a3635b..485d3a37 100644
+--- a/tools/test_spu_context_registries.py
++++ b/tools/test_spu_context_registries.py
+@@ -16,7 +16,7 @@ common = ['spu_drain.c', 'spu_lockstep.c', 'spu_coherency.c', 'spu_workload.c',
+           'spu_interp.c']
+ failed = []
+ with tempfile.TemporaryDirectory(prefix='spu-context-registry-') as tmp:
+-    for name in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_registry_allocation', 'test_spu_mfc_env_once']:
++    for name in ['test_spu_mfc_slots', 'test_spu_mfc_shared_lookup', 'test_spu_coherency', 'test_spu_lockline_peer', 'test_spu_getllar_snapshot', 'test_spu_registry_allocation', 'test_spu_mfc_env_once']:
+         binary = Path(tmp) / name
+         command = [os.environ.get('CC', 'cc'), '-std=gnu17', '-O1', '-UNDEBUG',
+                    '-I' + str(root / 'include'), '-I' + str(spu),
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,95 @@
+From 1a58c1a86045a39cf11f45c6a48e58dca4bdfb29 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 00:14:31 +0200
+Subject: [PATCH] lv2: sys_spu_thread_group_disconnect_event_all_threads;
+ unimplemented syscalls return ENOSYS
+
+Syscall 252 was an unimplemented stub that reported success, so every SPURS
+queue detach leaked its SPU event port; by Lost Episode 1 PhysX could not
+attach its queue (CELL_SPURS_TASK_ERROR_BUSY) and never initialised. It now
+releases the port, the inverse of 251. Unimplemented syscalls return ENOSYS
+instead of a false CELL_OK and are reported once per number rather than only
+for the first 30 calls.
+---
+ runtime/ppu/ppu_loader.cpp           | 15 +++++----------
+ runtime/syscalls/lv2_register.c      | 16 ++++++++++++++++
+ runtime/syscalls/lv2_syscall_table.h |  1 +
+ 3 files changed, 22 insertions(+), 10 deletions(-)
+
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index daccc941..d95c4415 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -2790,18 +2790,13 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+                 return;
+             }
+         }
+-        static int logged = 0;
+-        if (logged < 30) {
+-            fprintf(stderr, "[ppu] lv2_syscall %llu (stub)\n", (unsigned long long)num);
+-            logged++;
+-        }
+-        /* The UNIMPLEMENTED syscalls are the ones a trace is most wanted for, and
+-         * they were the only ones it skipped: sc_trace ran on both handled paths
+-         * but not here, so PS3_SCTRACE showed everything except the gaps. Snapshot
+-         * the args before the return value overwrites r3. */
++        static std::atomic<uint32_t> reported[1024 / 32];
++        const unsigned slot = (unsigned)(num & 1023u);
++        if (!(reported[slot >> 5].fetch_or(1u << (slot & 31u), std::memory_order_relaxed) & (1u << (slot & 31u))))
++            fprintf(stderr, "[ppu] lv2_syscall %llu is not implemented (ENOSYS)\n", (unsigned long long)num);
+         { uint64_t _a3 = ctx->gpr[3], _a4 = ctx->gpr[4],
+                    _a5 = ctx->gpr[5], _a6 = ctx->gpr[6];
+-          ctx->gpr[3] = 0;   /* CELL_OK */
++          ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010003;
+           sc_trace(num, ctx, _a3, _a4, _a5, _a6);
+           return; }
+     }
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index 1c9f6047..d127fa91 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -1241,6 +1241,21 @@ static int64_t sys_spu_thread_group_connect_event_all_threads_handler(ppu_contex
+     return (int64_t)(int32_t)result;
+ }
+ 
++static int64_t sys_spu_thread_group_disconnect_event_all_threads_handler(ppu_context* ctx)
++{
++    const uint32_t port = (uint32_t)ctx->gpr[4];
++    spu_group_t* g = port > 63u ? NULL : spu_find_group((uint32_t)ctx->gpr[3]);
++    uint32_t result = CELL_OK;
++    if (port > 63u) result = CELL_EINVAL;
++    else if (!g) result = CELL_ESRCH;
++    else {
++        AcquireSRWLockExclusive(&s_spu_port_lock);
++        g->user_event_ports[port] = 0;
++        ReleaseSRWLockExclusive(&s_spu_port_lock);
++    }
++    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)result;
++    return (int64_t)(int32_t)result;
++}
+ /* The interrupt mailbox encodes send_event (0..63) or throw_event (64..127).
+  * The preceding ordinary mailbox word is data, not a separate PPU event. */
+ static int spu_deliver_user_event(spu_context* spu, uint32_t value)
+@@ -2092,6 +2107,7 @@ void lv2_register_all_syscalls(lv2_syscall_table* tbl)
+     lv2_syscall_register(tbl, SYS_SPU_THREAD_BIND_QUEUE,      sys_spu_thread_stub);
+     lv2_syscall_register(tbl, SYS_SPU_THREAD_UNBIND_QUEUE,    sys_spu_thread_stub);
+     lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_connect_event_all_threads_handler);
++    lv2_syscall_register(tbl, SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS, sys_spu_thread_group_disconnect_event_all_threads_handler);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+diff --git a/runtime/syscalls/lv2_syscall_table.h b/runtime/syscalls/lv2_syscall_table.h
+index 85d76de8..43eaaa10 100644
+--- a/runtime/syscalls/lv2_syscall_table.h
++++ b/runtime/syscalls/lv2_syscall_table.h
+@@ -206,6 +206,7 @@ extern uint32_t g_ps3_sdk_version;
+ #define SYS_SPU_THREAD_BIND_QUEUE       193
+ #define SYS_SPU_THREAD_UNBIND_QUEUE     194
+ #define SYS_SPU_THREAD_GROUP_CONNECT_EVENT_ALL_THREADS 251
++#define SYS_SPU_THREAD_GROUP_DISCONNECT_EVENT_ALL_THREADS 252
+ 
+ /* PRX (module) management */
+ #define SYS_PRX_LOAD_MODULE             480
+-- 
+2.54.0 (Apple Git-157)
+

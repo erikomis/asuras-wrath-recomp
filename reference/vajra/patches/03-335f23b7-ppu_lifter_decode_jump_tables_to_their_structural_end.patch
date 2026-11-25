@@ -1,0 +1,121 @@
+From 335f23b78e7f5efdf9ceb6ba19113850454049d9 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 00:14:31 +0200
+Subject: [PATCH] ppu_lifter: decode jump tables to their structural end
+
+A switch whose bounds check the decoder could not tie to the index register
+fell back to a fixed 256-entry cap; Asura's level-load dispatcher has 373
+entries, so cases 257+ lifted to unresolved indirect calls and Lost Episode 1
+froze while loading. Tables now end where they end: an inline table at its
+first case, otherwise at the first invalid entry. The bounds-check scan that
+only fed the cap is removed.
+---
+ tools/ppu_lifter.py | 75 ++-------------------------------------------
+ 1 file changed, 3 insertions(+), 72 deletions(-)
+
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 099d56bc..5581d59d 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -12,6 +12,7 @@ Usage:
+ """
+ 
+ import argparse
++import itertools
+ import json
+ import os
+ import re
+@@ -4762,76 +4763,6 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                 [x.strip() for x in w.operands.split(',')][0] == rC and
+                 r_base in [x.strip() for x in w.operands.split(',')][1:]
+                 for w in win)
+-            # case count from the bound check `cmp[l]wi crN, rIdx, COUNT`. Match the
+-            # compare on the RAW INDEX register: the lwzx index (rIdx*4) is usually a
+-            # shift of the raw index (`rldic/clrlsldi rShift, rIdx, ...`), and the raw
+-            # index is what the switch bounds-checks. Blindly taking the nearest
+-            # cmpwi grabbed an unrelated `cmpwi r9,0` in a sibling basic block (the
+-            # 30-insn address window spans both arms of a branch), where r9 is only
+-            # reused as the shifted index LATER -> count=0 -> a single case decoded ->
+-            # LBP sub_422A40's 0x2A-case "GMTb" dispatcher fell through to an
+-            # unresolved indirect call (0x422CA0) and stalled the loader.
+-            _idx_reg = p[1] if r_base == p[2] else p[2]
+-            _raw_idx = _idx_reg
+-            for w in reversed(win):
+-                a = [x.strip() for x in w.operands.split(',')]
+-                if a and a[0] == _idx_reg:
+-                    if (w.mnemonic in ('rldic', 'rldicl', 'rldicr', 'rlwinm',
+-                                       'clrlsldi', 'sldi', 'slwi', 'clrldi')
+-                            and len(a) >= 2):
+-                        _raw_idx = a[1]
+-                    break                           # first (nearest) def of idx wins
+-            # Take the LARGEST immediate compared against the raw index: the switch
+-            # bounds-check (`cmplwi rIdx, COUNT`) uses the max index, while any
+-            # per-case `cmpwi rIdx, k` in the window tests a specific smaller case
+-            # value. Picking the nearest compare grabbed `cmpwi r7,1` (a case test)
+-            # -> count=1 -> only the default case decoded. Over-counting is safe: the
+-            # per-entry text-range validation below stops at the first bogus offset.
+-            count = None
+-            for w in reversed(win):
+-                if w.mnemonic in ('cmplwi', 'cmpwi'):
+-                    a = [x.strip() for x in w.operands.split(',')]
+-                    _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+-                    if _cmp_reg == _raw_idx:
+-                        try:
+-                            _c = int(a[-1], 0)
+-                        except ValueError:
+-                            continue
+-                        if count is None or _c > count:
+-                            count = _c
+-            # No compare in the 30-insn window: look for it in the function-bounded
+-            # window the base search already uses. The bound can sit further from
+-            # the bctr (Toro Lets Party func_000A2EC8: `cmplwi r29,0x123` 33 insns
+-            # before its bctr), and the 256 fallback then cut that 292-entry table:
+-            # cases 256+ lifted to unresolved indirect calls.
+-            if count is None:
+-                for w in reversed(win_cand):
+-                    if w.mnemonic in ('cmplwi', 'cmpwi'):
+-                        a = [x.strip() for x in w.operands.split(',')]
+-                        _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+-                        if _cmp_reg == _raw_idx:
+-                            try:
+-                                _c = int(a[-1], 0)
+-                            except ValueError:
+-                                continue
+-                            if count is None or _c > count:
+-                                count = _c
+-            if count is None or count < 0 or count > 4096:
+-                count = 256
+-            # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
+-            # counting: the backward window spans sibling basic blocks, so it can
+-            # latch a per-case test (`cmpwi rIdx, k`) instead of the real bounds
+-            # check and silently truncate the table. A truncated table drops real
+-            # cases, and the runtime `bctr` then lands on an unlifted mid-function
+-            # address -> "unresolved indirect call" -> the caller runs on garbage.
+-            # (LBP func_0038F380: a 31-entry offset table decoded as 19 because a
+-            # stray `cmpwi 18` won; case 22 = 0x0038F754 fell through to the global
+-            # dispatcher -- which only knows function ENTRIES, not mid-function
+-            # labels -- and the boot died in a storm of vcalls through a job
+-            # descriptor's name string.) The per-entry validation below already
+-            # finds the true end, so scan generously and let it terminate.
+-            scan = min(max(count + 1, 256), 4096)
+-
+             # Multi-TOC executables (e.g. LBP: two TOCs, ~3.6k/2.2k functions each)
+             # load the table base relative to WHICHEVER r2 their function runs
+             # with. We don't track per-function TOCs here, so try each candidate
+@@ -4852,11 +4783,11 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
+                 table_base = _read_ptr(cand + disp, base_is_ld)
+                 if table_base is not None and disp2 is not None:
+                     table_base = _read_ptr(table_base + disp2, disp2_is_ld)
+-                _dbg(all_insns[i].addr, f"r_base={r_base} cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} count={count} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
++                _dbg(all_insns[i].addr, f"r_base={r_base} cand_toc=0x{cand:X} table_base={None if table_base is None else hex(table_base)} is_offset={is_offset} text=[0x{text_lo:X},0x{text_hi:X})")
+                 if table_base is None:
+                     continue
+                 targets = []
+-                for k in range(scan):
++                for k in itertools.count():
+                     ea = (table_base + k * 4) & 0xFFFFFFFF
+                     # Structural end-of-table: a jump table never overlaps the code
+                     # it dispatches to, so once the cursor reaches the lowest case
+-- 
+2.54.0 (Apple Git-157)
+

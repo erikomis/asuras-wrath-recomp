@@ -1,0 +1,563 @@
+From 2cbb6841f8803272363c1dfbdbeea4201133f399 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:38:25 +0200
+Subject: [PATCH] Size the sys_memory allocation table to the byte budget;
+ resolution scaling core
+
+---
+ libs/video/rsx_spirv.c         | 13 ++++---
+ libs/video/rsx_spirv.h         |  4 +-
+ libs/video/vk/rsx_vk.cpp       | 25 ++++++------
+ libs/video/vk/vk_draw.cpp      | 11 ++++--
+ libs/video/vk/vk_occlusion.cpp | 16 ++++----
+ libs/video/vk/vk_occlusion.h   | 10 +++--
+ libs/video/vk/vk_renderer.cpp  | 70 +++++++++++++++++++++++++++-------
+ libs/video/vk/vk_renderer.h    |  6 ++-
+ libs/video/vk/vk_state.cpp     |  2 +-
+ libs/video/vk/vk_state.h       |  1 +
+ runtime/syscalls/sys_memory.c  |  1 -
+ runtime/syscalls/sys_memory.h  |  3 +-
+ 12 files changed, 111 insertions(+), 51 deletions(-)
+
+diff --git a/libs/video/rsx_spirv.c b/libs/video/rsx_spirv.c
+index 7c324ba1..ac480eef 100644
+--- a/libs/video/rsx_spirv.c
++++ b/libs/video/rsx_spirv.c
+@@ -782,9 +782,9 @@ static u32 vp_layout(vpc* c)
+     deco1(s, av, DEC_ArrayStride, 16);
+     deco1(s, as, DEC_ArrayStride, 16);
+     u32 u = tu(s);
+-    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ au, av, as, u, u, u, u, u }, 8, 1);
+-    static const u32 offs[8] = { 0, 256, 512, 576, 580, 584, 588, 592 };
+-    for (u32 m = 0; m < 8; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
++    u32 st_ = intern(s, OpTypeStruct, 0, (const u32[]){ au, av, as, u, u, u, u, u, tf(s), tf(s) }, 10, 1);
++    static const u32 offs[10] = { 0, 256, 512, 576, 580, 584, 588, 592, 596, 600 };
++    for (u32 m = 0; m < 10; m++) mdeco(s, st_, m, DEC_Offset, offs[m]);
+     deco(s, st_, DEC_Block);
+     c->ubo_l = gvar(s, st_, SC_Uniform, 0);
+     deco1(s, c->ubo_l, DEC_DescriptorSet, 0);
+@@ -1298,10 +1298,13 @@ static void vp_epilogue(vpc* c)
+         }
+         st(s, ov, val);
+     }
+-    if ((mask & RSX_SPV_VPOUT_POINTSIZE) && (c->written & (1u << 6))) {
++    {
+         u32 ps = gvar(s, tf(s), SC_Output, 0);
+         deco1(s, ps, DEC_BuiltIn, BI_PointSize);
+-        st(s, ps, exf(s, ld(s, T4, c->o[6]), 0));
++        u32 pf = tptr(s, SC_Uniform, tf(s));
++        u32 size = ((mask & RSX_SPV_VPOUT_POINTSIZE) && (c->written & (1u << 6))) ? exf(s, ld(s, T4, c->o[6]), 0)
++                                                                                    : ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 8)));
++        st(s, ps, fmul(s, tf(s), size, ld(s, tf(s), I(s, OpAccessChain, pf, vp_layout(c), ci(s, 9)))));
+     }
+     u32 qual = 0;
+     for (u32 p = 0; p < 6; p++) {
+diff --git a/libs/video/rsx_spirv.h b/libs/video/rsx_spirv.h
+index bdb051e0..af7ea896 100644
+--- a/libs/video/rsx_spirv.h
++++ b/libs/video/rsx_spirv.h
+@@ -126,7 +126,9 @@ typedef struct rsx_spv_vertex_layout {
+     u32 clip_planes;
+     u32 flags;
+     u32 transform_branch_bits;
+-    u32 reserved[3];
++    float point_size;
++    float point_scale;
++    u32 reserved;
+ } rsx_spv_vertex_layout;
+ 
+ typedef struct rsx_spv_texture_state {
+diff --git a/libs/video/vk/rsx_vk.cpp b/libs/video/vk/rsx_vk.cpp
+index 420d3b76..aedbf163 100644
+--- a/libs/video/vk/rsx_vk.cpp
++++ b/libs/video/vk/rsx_vk.cpp
+@@ -427,6 +427,10 @@ bool presenter_build()
+     }
+     const char* base = SDL_GetBasePath();
+     const std::string cache = std::string(base ? base : "") + "vk_pipelines.bin";
++    const char* forced = std::getenv("PS3_RESOLUTION_SCALE");
++    const uint32_t requested = forced ? (uint32_t)std::strtoul(forced, nullptr, 10) : 0u;
++    g.r.resolution_scale = requested ? std::clamp(requested, 1u, 8u) : std::max(1u, (g.pixel_h.load() + 719u) / 720u);
++    std::fprintf(stderr, "[vk] resolution scale %ux (%ux%u for a 1280x720 frame)\n", g.r.resolution_scale, 1280u * g.r.resolution_scale, 720u * g.r.resolution_scale);
+     return g.r.open(g.d, g.timeline, &g.submitted, cache.c_str());
+ }
+ 
+@@ -870,15 +874,12 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
+     }
+     slot& s = g.slots[i];
+     timeline_wait(g.present_timeline, s.released);
+-    if (!slot_reserve(s, w, h)) {
+-        g.r.flush();
+-        return;
+-    }
+-
+     vk::image* src = nullptr;
++    u32 scale = 1;
+     VkCommandBuffer cmd = VK_NULL_HANDLE;
+-    g.r.present_source(ea, w, h, pitch, src, cmd);
+-    if (!src) {
++    g.r.present_source(ea, w, h, pitch, src, scale, cmd);
++    const uint32_t sw = std::min(w * scale, src ? src->width : 0u), sh = std::min(h * scale, src ? src->height : 0u);
++    if (!src || !slot_reserve(s, sw, sh)) {
+         g.r.flush();
+         return;
+     }
+@@ -899,9 +900,9 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
+     vkCmdPipelineBarrier2(cmd, &di);
+     VkImageBlit region{};
+     region.srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+-    region.srcOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
++    region.srcOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
+     region.dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+-    region.dstOffsets[1] = { (int32_t)w, (int32_t)h, 1 };
++    region.dstOffsets[1] = { (int32_t)sw, (int32_t)sh, 1 };
+     vkCmdBlitImage(cmd, src->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, s.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region,
+                    VK_FILTER_NEAREST);
+     b.srcStageMask = VK_PIPELINE_STAGE_2_BLIT_BIT;
+@@ -921,7 +922,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
+     VmaAllocationInfo cap_info{};
+     if (capture_path) {
+         VkBufferCreateInfo bi{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+-        bi.size = (VkDeviceSize)w * h * 4u;
++        bi.size = (VkDeviceSize)sw * sh * 4u;
+         bi.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+         VmaAllocationCreateInfo ai{};
+         ai.usage = VMA_MEMORY_USAGE_AUTO;
+@@ -929,7 +930,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
+         if (vmaCreateBuffer(g.d.vma, &bi, &ai, &cap_buf, &cap_mem, &cap_info) == VK_SUCCESS) {
+             VkBufferImageCopy rg{};
+             rg.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+-            rg.imageExtent = { w, h, 1 };
++            rg.imageExtent = { sw, sh, 1 };
+             vkCmdCopyImageToBuffer(cmd, s.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, cap_buf, 1, &rg);
+             VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+             mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+@@ -947,7 +948,7 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
+     if (cap_buf) {
+         timeline_wait(g.timeline, s.rendered);
+         vmaInvalidateAllocation(g.d.vma, cap_mem, 0, VK_WHOLE_SIZE);
+-        write_bmp(capture_path, static_cast<const uint8_t*>(cap_info.pMappedData), w, h);
++        write_bmp(capture_path, static_cast<const uint8_t*>(cap_info.pMappedData), sw, sh);
+         vmaDestroyBuffer(g.d.vma, cap_buf, cap_mem);
+         std::fprintf(stderr, "[vk] captured flip %llu to %s\n", (unsigned long long)flips, capture_path);
+     }
+diff --git a/libs/video/vk/vk_draw.cpp b/libs/video/vk/vk_draw.cpp
+index 412f69f3..5bf7a545 100644
+--- a/libs/video/vk/vk_draw.cpp
++++ b/libs/video/vk/vk_draw.cpp
+@@ -266,6 +266,8 @@ bool renderer::upload_vertices(const rsx::draw_clause& clause, u32 first, u32 co
+     }
+     layout.clip_planes = planes;
+     layout.transform_branch_bits = r(rsx::M_TRANSFORM_BRANCH_BITS);
++    layout.point_size = f(rsx::M_POINT_SIZE);
++    layout.point_scale = (float)m_fb.scale;
+ 
+     data = { slice.buffer, slice.offset, total };
+     vk_slice ls = m_ring.alloc(sizeof layout, m_ubo_align);
+@@ -484,7 +486,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
+     fs.fog_param[0] = f(rsx::M_FOG_PARAMS);
+     fs.fog_param[1] = f(rsx::M_FOG_PARAMS + 4u);
+     const bool bottom = ((window >> 12) & 0xFu) != 0;
+-    fs.wpos_scale = bottom ? -1.f : 1.f;
++    fs.wpos_scale = (bottom ? -1.f : 1.f) / (float)m_fb.scale;
+     fs.wpos_bias = bottom ? (float)(window & 0xFFFu) : 0.f;
+     VkDescriptorImageInfo images[rsx::TEXTURES + rsx::VERTEX_TEXTURES];
+     for (u32 u = 0; u < rsx::TEXTURES + rsx::VERTEX_TEXTURES; u++) {
+@@ -512,8 +514,9 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
+     draw_target t{};
+     t.width = m_fb.width;
+     t.height = m_fb.height;
+-    t.aa_u = m_fb.aa_u;
+-    t.aa_v = m_fb.aa_v;
++    t.aa_u = m_fb.aa_u * m_fb.scale;
++    t.aa_v = m_fb.aa_v * m_fb.scale;
++    t.scale = m_fb.scale;
+     t.depth = m_fb.depth != nullptr;
+     t.stencil = m_fb.depth && (m_fb.depth->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT);
+     for (u32 k = 0; k < 4; k++) t.color_format[k] = m_fb.color_format[k];
+@@ -532,7 +535,7 @@ void renderer::draw_execute(const rsx::draw_clause& clause, u32 id)
+ 
+     begin_rendering();
+     VkCommandBuffer c = cmd();
+-    if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c);
++    if (m_occlusion.enabled() && !m_occlusion.active()) m_occlusion.begin(c, m_fb.scale);
+     vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, pipe);
+     set_dynamic_state(c, *this, *m_d, m_pipelines, t, prim, restart && clause.kind == rsx::draw_kind::indexed, key);
+ 
+diff --git a/libs/video/vk/vk_occlusion.cpp b/libs/video/vk/vk_occlusion.cpp
+index 938df536..99747ffc 100644
+--- a/libs/video/vk/vk_occlusion.cpp
++++ b/libs/video/vk/vk_occlusion.cpp
+@@ -60,17 +60,17 @@ uint32_t occlusion::allocate()
+     return q;
+ }
+ 
+-void occlusion::begin(VkCommandBuffer cmd)
++void occlusion::begin(VkCommandBuffer cmd, uint32_t scale)
+ {
+     const uint32_t q = allocate();
+     vkCmdBeginQuery(cmd, m_pool, q, m_control);
+-    m_segments.push_back(q);
++    m_segments.push_back({ q, scale * scale });
+     m_active = true;
+ }
+ 
+ void occlusion::end(VkCommandBuffer cmd)
+ {
+-    vkCmdEndQuery(cmd, m_pool, m_segments.back());
++    vkCmdEndQuery(cmd, m_pool, m_segments.back().query);
+     m_active = false;
+ }
+ 
+@@ -136,19 +136,19 @@ void occlusion::worker()
+         wi.pValues = &j.value;
+         vkWaitSemaphores(m_d->dev, &wi, UINT64_MAX);
+         if (j.release) {
+-            for (uint32_t q : j.queries) vkResetQueryPool(m_d->dev, m_pool, q, 1);
++            for (const segment& g : j.queries) vkResetQueryPool(m_d->dev, m_pool, g.query, 1);
+             {
+                 std::lock_guard<std::mutex> hold(m_lock);
+-                m_free.insert(m_free.end(), j.queries.begin(), j.queries.end());
++                for (const segment& g : j.queries) m_free.push_back(g.query);
+             }
+             m_freed.notify_all();
+             continue;
+         }
+         uint64_t sum = 0;
+-        for (uint32_t q : j.queries) {
++        for (const segment& g : j.queries) {
+             uint64_t n = 0;
+-            vkGetQueryPoolResults(m_d->dev, m_pool, q, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT);
+-            sum += n;
++            vkGetQueryPoolResults(m_d->dev, m_pool, g.query, 1, sizeof n, &n, sizeof n, VK_QUERY_RESULT_64_BIT);
++            sum += n ? std::max<uint64_t>(n / g.area, 1u) : 0u;
+         }
+         write_report(j.ea, sum);
+         {
+diff --git a/libs/video/vk/vk_occlusion.h b/libs/video/vk/vk_occlusion.h
+index 6c81ab16..99b1c5d3 100644
+--- a/libs/video/vk/vk_occlusion.h
++++ b/libs/video/vk/vk_occlusion.h
+@@ -19,7 +19,7 @@ public:
+     bool enabled() const { return m_enabled; }
+     bool active() const { return m_active; }
+     void enable(bool on) { m_enabled = on; }
+-    void begin(VkCommandBuffer cmd);
++    void begin(VkCommandBuffer cmd, uint32_t scale);
+     void end(VkCommandBuffer cmd);
+     void clear();
+     void report(uint32_t ea);
+@@ -29,11 +29,15 @@ public:
+     void drain();
+ 
+ private:
++    struct segment {
++        uint32_t query;
++        uint32_t area;
++    };
+     struct job {
+         uint32_t ea;
+         bool release;
+         uint64_t value;
+-        std::vector<uint32_t> queries;
++        std::vector<segment> queries;
+     };
+ 
+     void worker();
+@@ -45,7 +49,7 @@ private:
+     VkQueryControlFlags m_control = 0;
+     bool m_enabled = false;
+     bool m_active = false;
+-    std::vector<uint32_t> m_segments;
++    std::vector<segment> m_segments;
+     std::vector<job> m_pending;
+ 
+     std::mutex m_lock;
+diff --git a/libs/video/vk/vk_renderer.cpp b/libs/video/vk/vk_renderer.cpp
+index 789d4791..1c721d20 100644
+--- a/libs/video/vk/vk_renderer.cpp
++++ b/libs/video/vk/vk_renderer.cpp
+@@ -11,6 +11,8 @@ namespace {
+ 
+ enum fb_context : u32 { FB_DRAW = 0, FB_CLEAR_COLOR = 1, FB_CLEAR_DEPTH = 2 };
+ 
++constexpr u32 k_min_scalable = 16;
++
+ enum : u32 {
+     CLEAR_Z = 0x01u, CLEAR_S = 0x02u, CLEAR_R = 0x10u, CLEAR_G = 0x20u, CLEAR_B = 0x40u, CLEAR_A = 0x80u,
+     CLEAR_RGBA = 0xF0u, CLEAR_ANY = 0xF3u,
+@@ -77,7 +79,7 @@ bool ranges_overlap(u32 a, u32 an, u32 b, u32 bn)
+ 
+ bool framebuffer::operator==(const framebuffer& o) const
+ {
+-    if (width != o.width || height != o.height || aa_u != o.aa_u || aa_v != o.aa_v || count != o.count || depth != o.depth ||
++    if (width != o.width || height != o.height || aa_u != o.aa_u || aa_v != o.aa_v || scale != o.scale || count != o.count || depth != o.depth ||
+         depth_write != o.depth_write)
+         return false;
+     for (u32 i = 0; i < 4; i++)
+@@ -291,11 +293,12 @@ void renderer::retire(surface* s)
+ 
+ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 format, bool depth, u32 aa_u, u32 aa_v)
+ {
++    const u32 scale = std::max(width, height) > k_min_scalable ? resolution_scale : 1u;
+     surface* grow_from = nullptr;
+     for (auto& p : m_surfaces) {
+         surface* s = p.get();
+         if (s->ea != ea || s->depth != depth) continue;
+-        if (s->gcm_format == format && s->pitch == pitch && s->aa_u == aa_u && s->aa_v == aa_v) {
++        if (s->gcm_format == format && s->pitch == pitch && s->aa_u == aa_u && s->aa_v == aa_v && s->scale == scale) {
+             if (s->width >= width && s->height >= height) return s;
+             grow_from = s;
+         }
+@@ -311,6 +314,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
+     s->depth = depth;
+     s->aa_u = aa_u;
+     s->aa_v = aa_v;
++    s->scale = scale;
+     s->bpp = depth ? (format == 1 ? 2u : 4u) : color_bpp(format);
+     const bool depth_float = (r(rsx::M_CONTROL0) >> 12) & 1u;
+     s->depth_float = depth && depth_float;
+@@ -326,7 +330,7 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
+         aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+         usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+     }
+-    if (!create_image(s->img, vf, s->width * aa_u, s->height * aa_v, usage, aspect)) return nullptr;
++    if (!create_image(s->img, vf, s->width * aa_u * scale, s->height * aa_v * scale, usage, aspect)) return nullptr;
+ 
+     VkCommandBuffer c = cmd();
+     if (grow_from) {
+@@ -359,11 +363,23 @@ surface* renderer::surface_for(u32 ea, u32 pitch, u32 width, u32 height, u32 for
+     return s;
+ }
+ 
++void renderer::scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter filter)
++{
++    barrier(c, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++    barrier(c, dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_BLIT_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++    VkImageBlit region{};
++    region.srcSubresource = { src.aspect, 0, 0, 1 };
++    region.srcOffsets[1] = { (int32_t)src.width, (int32_t)src.height, 1 };
++    region.dstSubresource = { dst.aspect, 0, 0, 1 };
++    region.dstOffsets[1] = { (int32_t)dst.width, (int32_t)dst.height, 1 };
++    vkCmdBlitImage(c, src.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dst.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, filter);
++}
++
+ void renderer::load_surface(surface& s)
+ {
+     VkCommandBuffer c = cmd();
+     end_rendering();
+-    const u32 w = s.img.width, h = s.img.height;
++    const u32 w = s.img.width / s.scale, h = s.img.height / s.scale;
+     const u32 row = w * s.bpp;
+     if (!s.depth) {
+         const uint8_t* src = vm_base + s.ea;
+@@ -402,12 +418,23 @@ void renderer::load_surface(surface& s)
+                     break;
+                 }
+             }
+-            barrier(c, s.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
++            image native{};
++            image* target = &s.img;
++            if (s.scale > 1u) {
++                if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
++                    return;
++                target = &native;
++            }
++            barrier(c, *target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+             VkBufferImageCopy region{};
+             region.bufferOffset = slice.offset;
+             region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+             region.imageExtent = { w, h, 1 };
+-            vkCmdCopyBufferToImage(c, slice.buffer, s.img.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++            vkCmdCopyBufferToImage(c, slice.buffer, target->handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
++            if (target == &native) {
++                scale_blit(c, native, s.img, VK_FILTER_LINEAR);
++                m_garbage.emplace_back(*m_submitted + 1u, native);
++            }
+             s.state = SURFACE_VALID;
+             return;
+         }
+@@ -429,15 +456,24 @@ void renderer::download_surface(surface& s)
+     if (!s.gpu_dirty || s.depth) return;
+     VkCommandBuffer c = cmd();
+     end_rendering();
+-    const u32 w = s.img.width, h = s.img.height, row = w * s.bpp;
++    const u32 w = s.img.width / s.scale, h = s.img.height / s.scale, row = w * s.bpp;
+     vk_slice slice = m_ring.alloc((VkDeviceSize)row * h, 16);
+     if (!slice.ptr) return;
+-    barrier(c, s.img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
++    image native{};
++    image* source = &s.img;
++    if (s.scale > 1u) {
++        if (!create_image(native, s.img.format, w, h, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, VK_IMAGE_ASPECT_COLOR_BIT))
++            return;
++        scale_blit(c, s.img, native, VK_FILTER_LINEAR);
++        source = &native;
++    }
++    barrier(c, *source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_READ_BIT);
+     VkBufferImageCopy region{};
+     region.bufferOffset = slice.offset;
+     region.imageSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 };
+     region.imageExtent = { w, h, 1 };
+-    vkCmdCopyImageToBuffer(c, s.img.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
++    vkCmdCopyImageToBuffer(c, source->handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, slice.buffer, 1, &region);
++    if (source == &native) m_garbage.emplace_back(*m_submitted + 1u, native);
+     VkMemoryBarrier2 mb{ VK_STRUCTURE_TYPE_MEMORY_BARRIER_2 };
+     mb.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+     mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+@@ -624,12 +660,16 @@ bool renderer::bind_framebuffer(u32 context)
+         fb.color[k] = surface_for(ea, color_pitch[k], width, height, color_fmt, false, aa_u, aa_v);
+         if (!fb.color[k]) continue;
+         fb.color_format[k] = fb.color[k]->img.format;
++        fb.scale = fb.color[k]->scale;
+         fb.count = k + 1u;
+     }
+     if (zeta_ea) {
+         const u32 ea = zeta_ea + zeta_pitch * woy + depth_texel * wox;
+         fb.depth = surface_for(ea, zeta_pitch, width, height, depth_fmt ? depth_fmt : 2u, true, aa_u, aa_v);
+-        if (fb.depth) fb.depth_format = fb.depth->img.format;
++        if (fb.depth) {
++            fb.depth_format = fb.depth->img.format;
++            fb.scale = fb.depth->scale;
++        }
+     }
+     if (!(fb == m_fb) || !m_fb_valid) {
+         end_rendering();
+@@ -670,7 +710,7 @@ void renderer::begin_rendering()
+         if (s->img.aspect & VK_IMAGE_ASPECT_STENCIL_BIT) stencil = depth;
+     }
+     VkRenderingInfo ri{ VK_STRUCTURE_TYPE_RENDERING_INFO };
+-    ri.renderArea = { { 0, 0 }, { m_fb.width * m_fb.aa_u, m_fb.height * m_fb.aa_v } };
++    ri.renderArea = { { 0, 0 }, { m_fb.width * m_fb.aa_u * m_fb.scale, m_fb.height * m_fb.aa_v * m_fb.scale } };
+     ri.layerCount = 1;
+     ri.colorAttachmentCount = m_fb.count;
+     ri.pColorAttachments = color;
+@@ -742,8 +782,8 @@ void renderer::on_clear(u32 mask)
+     }
+     if (!count) return;
+     begin_rendering();
+-    const VkClearRect rect{ { { (int32_t)(x0 * m_fb.aa_u), (int32_t)(y0 * m_fb.aa_v) },
+-                              { (x1 - x0) * m_fb.aa_u, (y1 - y0) * m_fb.aa_v } }, 0, 1 };
++    const u32 hx = m_fb.aa_u * m_fb.scale, hy = m_fb.aa_v * m_fb.scale;
++    const VkClearRect rect{ { { (int32_t)(x0 * hx), (int32_t)(y0 * hy) }, { (x1 - x0) * hx, (y1 - y0) * hy } }, 0, 1 };
+     vkCmdClearAttachments(cmd(), count, att, 1, &rect);
+     stats.clears++;
+     m_draw_counter++;
+@@ -841,16 +881,18 @@ bool renderer::report(u32 type, u32 ea)
+     return true;
+ }
+ 
+-void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, VkCommandBuffer& c)
++void renderer::present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, u32& scale, VkCommandBuffer& c)
+ {
+     c = cmd();
+     end_rendering();
+     out = nullptr;
++    scale = 1;
+     for (auto& p : m_surfaces) {
+         surface* s = p.get();
+         if (s->depth || s->ea != ea || s->state != SURFACE_VALID) continue;
+         if (s->bpp != 4 || s->pitch != pitch) continue;
+         out = &s->img;
++        scale = s->scale;
+         stats.present_surface++;
+         if (m_trace) std::fprintf(stderr, "[trace] scanout surface %08X %ux%u image %ux%u\n", ea, width, height, s->img.width, s->img.height);
+         return;
+diff --git a/libs/video/vk/vk_renderer.h b/libs/video/vk/vk_renderer.h
+index bb1be230..17e008d9 100644
+--- a/libs/video/vk/vk_renderer.h
++++ b/libs/video/vk/vk_renderer.h
+@@ -50,6 +50,7 @@ struct surface {
+     u32 bpp = 0;
+     u32 aa_u = 1;
+     u32 aa_v = 1;
++    u32 scale = 1;
+     surface_state state = SURFACE_UNINITIALIZED;
+     bool gpu_dirty = false;
+     u64 last_use = 0;
+@@ -66,6 +67,7 @@ struct framebuffer {
+     u32 height = 0;
+     u32 aa_u = 1;
+     u32 aa_v = 1;
++    u32 scale = 1;
+     u32 count = 0;
+     surface* color[4] = {};
+     surface* depth = nullptr;
+@@ -88,13 +90,14 @@ public:
+     void close();
+ 
+     void flush();
+-    void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, VkCommandBuffer& cmd);
++    void present_source(u32 ea, u32 width, u32 height, u32 pitch, image*& out, u32& scale, VkCommandBuffer& cmd);
+     void submit(VkSemaphore wait, VkPipelineStageFlags2 wait_stage, VkSemaphore signal);
+     void read_back(u32 ea, u32 size);
+     void wrote(u32 ea, u32 size);
+     void flip_reset();
+     bool report(u32 type, u32 ea);
+     std::atomic<bool> trace_request{ false };
++    u32 resolution_scale = 1;
+ 
+     static void barrier(VkCommandBuffer cmd, image& img, VkImageLayout layout, VkPipelineStageFlags2 stage, VkAccessFlags2 access);
+ 
+@@ -113,6 +116,7 @@ private:
+     void destroy_image(image& img);
+     void retire(surface* s);
+     void load_surface(surface& s);
++    void scale_blit(VkCommandBuffer c, image& src, image& dst, VkFilter filter);
+     void download_surface(surface& s);
+ 
+     vk_device* m_d = nullptr;
+diff --git a/libs/video/vk/vk_state.cpp b/libs/video/vk/vk_state.cpp
+index 8f2acc16..4b9db862 100644
+--- a/libs/video/vk/vk_state.cpp
++++ b/libs/video/vk/vk_state.cpp
+@@ -170,7 +170,7 @@ void set_dynamic_state(VkCommandBuffer cmd, const frontend& f, const vk_device&
+     vkCmdSetScissorWithCount(cmd, 1, &sc);
+ 
+     const uint32_t lw = f.r(rsx::M_LINE_WIDTH);
+-    float width = (float)(lw >> 3) + (float)(lw & 7u) / 8.f;
++    float width = ((float)(lw >> 3) + (float)(lw & 7u) / 8.f) * (float)t.scale;
+     width = d.features.features.wideLines ? std::clamp(width, d.props.limits.lineWidthRange[0], d.props.limits.lineWidthRange[1]) : 1.f;
+     vkCmdSetLineWidth(cmd, width);
+ 
+diff --git a/libs/video/vk/vk_state.h b/libs/video/vk/vk_state.h
+index bb6803c0..1bcd7120 100644
+--- a/libs/video/vk/vk_state.h
++++ b/libs/video/vk/vk_state.h
+@@ -10,6 +10,7 @@ struct draw_target {
+     uint32_t height;
+     uint32_t aa_u;
+     uint32_t aa_v;
++    uint32_t scale;
+     bool depth;
+     bool stencil;
+     bool depth_float;
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index fae809f1..f5941fe9 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -19,7 +19,6 @@ sys_mmapper_shared_info  g_sys_mmapper_shared[SYS_MMAPPER_SHARED_MAX];
+ uint32_t g_sys_mem_bump_ptr = 0;
+ 
+ /* Total user memory size (default 213 MB, after kernel reservation) */
+-#define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
+ #define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu   /* SYS_MEMORY_CONTAINER_ID_INVALID: the default container */
+ 
+ /* LV2 user memory and mapper reservations occupy separate address domains.
+diff --git a/runtime/syscalls/sys_memory.h b/runtime/syscalls/sys_memory.h
+index f394a033..75c1b18b 100644
+--- a/runtime/syscalls/sys_memory.h
++++ b/runtime/syscalls/sys_memory.h
+@@ -22,7 +22,8 @@ extern "C" {
+ #define SYS_MEMORY_PAGE_SIZE_64K  0x200
+ 
+ /* Maximum tracked allocations */
+-#define SYS_MEMORY_ALLOC_MAX      1024
++#define SYS_MEM_USER_TOTAL        (213u * 1024u * 1024u)
++#define SYS_MEMORY_ALLOC_MAX      (SYS_MEM_USER_TOTAL / 0x10000u)
+ #define SYS_MEMORY_CONTAINER_MAX  16
+ #define SYS_MMAPPER_SHARED_MAX    64
+ 
+-- 
+2.54.0 (Apple Git-157)
+

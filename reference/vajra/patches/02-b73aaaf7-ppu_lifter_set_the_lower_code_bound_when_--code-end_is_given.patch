@@ -1,0 +1,25 @@
+From b73aaaf7e80160481a82f3c051d7332575784000 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:38:52 +0200
+Subject: [PATCH] ppu_lifter: set the lower code bound when --code-end is given
+
+---
+ tools/ppu_lifter.py | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 464ff41b..199db1b2 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -5550,6 +5550,8 @@ def main() -> None:
+     if len(toc_candidates) == 1:
+         lifter.toc_base = toc_candidates[0]
+     lifter.code_hi = args.code_end
++    if lifter.code_hi is not None and func_bounds:
++        lifter.code_lo = min(s for s, _ in func_bounds)
+     # Without --code-end, default the executable window to the function-bounds
+     # span so branches into data still get clamped. With no window at all, a
+     # garbage target decoded from data (e.g. dead bytes after a blrl reached by
+-- 
+2.54.0 (Apple Git-157)
+

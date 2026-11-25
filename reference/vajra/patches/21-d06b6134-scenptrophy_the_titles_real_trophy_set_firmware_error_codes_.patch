@@ -1,0 +1,2353 @@
+From d06b61343dd0b8d56df4d25ee595e92414331ea2 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 14:23:14 +0200
+Subject: [PATCH] sceNpTrophy: the title's real trophy set, firmware error
+ codes and layouts
+
+The trophy set is read from the title's TROPHY.TRP: the booted application's
+TROPDIR (an installed disc-game update) first, then the disc, and the
+TROP_<language>.SFM text (else TROP.SFM), as RPCS3 does. GetGameInfo,
+GetTrophyInfo, GetTrophyUnlockState, GetGameProgress, UnlockTrophy (with the
+platinum rule: unlocked with the last trophy linked to it) and
+GetRequiredDiskSpace (pack size minus header and entry table) answer from it.
+Every guest struct is written big-endian at its real offsets; the old code
+wrote a fabricated 32-trophy set in host byte order, which titles read as
+0x20000000 trophies.
+
+Error codes, the 1024-byte description fields, GameDetails' reserved tail,
+the processing status values and the context/handle validation are the
+firmware's (they were a made-up 0x805516xx range). Registration calls the
+status callback with INSTALLED or NOT_INSTALLED, honours a negative return,
+then queues SETUP/PROGRESS/FINALIZE/COMPLETE through sysutil. Unlock times
+are CellRtc ticks.
+
+trophy_files.c/.h (TRP and SFM reader) is from the inFAMOUS 2 port
+(SamiEnazi/infamous2-port, MIT), with the full 1024-byte detail and the
+title-detail text added and the header sizes kept for the space query.
+
+cellFs maps /dev_hdd0 to $PS3_HDD0_ROOT like sys_fs and ppu_fs do;
+ps3_sysutil_language() exposes the system language to other modules.
+
+The trophy tests are rewritten for this behaviour with a generated pack
+fixture; they are POSIX-only and were not run on this Windows host.
+---
+ libs/filesystem/cellFs.c                      |   4 +-
+ libs/network/sceNpTrophy.c                    | 752 +++++++++---------
+ libs/network/sceNpTrophy.h                    | 112 +--
+ libs/network/tests/test_trophy_registration.c | 112 ++-
+ libs/network/tests/test_trophy_start.c        |  48 +-
+ libs/network/tests/trophy_fixture.h           |  99 +++
+ libs/network/trophy_files.c                   | 596 ++++++++++++++
+ libs/network/trophy_files.h                   | 158 ++++
+ libs/system/cellSysutil.c                     |   2 +
+ libs/system/cellSysutil.h                     |   1 +
+ 10 files changed, 1445 insertions(+), 439 deletions(-)
+ create mode 100644 libs/network/tests/trophy_fixture.h
+ create mode 100644 libs/network/trophy_files.c
+ create mode 100644 libs/network/trophy_files.h
+
+diff --git a/libs/filesystem/cellFs.c b/libs/filesystem/cellFs.c
+index 4d916ac7..1609f00f 100644
+--- a/libs/filesystem/cellFs.c
++++ b/libs/filesystem/cellFs.c
+@@ -70,7 +70,9 @@ static void init_default_mappings(void)
+         return;
+     s_initialized = 1;
+ 
+-    cellfs_add_path_mapping("/dev_hdd0/",  "gamedata/dev_hdd0/");
++    const char* hdd0_root = getenv("PS3_HDD0_ROOT");
++    cellfs_add_path_mapping("/dev_hdd0/",
++                           hdd0_root && *hdd0_root ? hdd0_root : "gamedata/dev_hdd0/");
+     const char* disc_root = getenv("PS3_VFS_ROOT");
+     cellfs_add_path_mapping("/dev_bdvd/",
+                            disc_root && *disc_root ? disc_root : "gamedata/dev_bdvd/");
+diff --git a/libs/network/sceNpTrophy.c b/libs/network/sceNpTrophy.c
+index d956e6dd..d5d13369 100644
+--- a/libs/network/sceNpTrophy.c
++++ b/libs/network/sceNpTrophy.c
+@@ -1,49 +1,36 @@
+-/*
+- * ps3recomp - sceNpTrophy HLE implementation
+- *
+- * Trophy management with persistent storage.  Unlocked trophies are saved
+- * to a JSON file at gamedata/trophies/{commId}.json.
+- *
+- * JSON format (hand-written, no external dependency):
+- * { "trophies": [ { "id": N, "timestamp": T }, ... ] }
+- */
+-
+ #include "sceNpTrophy.h"
++#include "trophy_files.h"
++#include <stddef.h>
+ #include "../system/cellSysutil.h"
++#include "../system/cellGame.h"
++#include "../filesystem/cellFs.h"
+ #include "ps3emu/guest_call.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <time.h>
+ #include <stdint.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_base (guest mem) */
+-#include "ps3emu/endian.h"                   /* ps3_bswap64 -- guest is big-endian */
+-#include "../guest_struct.h"   /* GUEST_EA, guest_struct_load/store */
+-/* HLE args arrive as guest effective addresses; translate before deref. */
+-#define GUEST_PTR(p, T) ((T)((p) ? (void*)(vm_base + (uint32_t)(uintptr_t)(p)) : (void*)0))
++#include "../../runtime/ppu/ppu_memory.h"
++#include "../guest_struct.h"
+ 
+ #ifdef _WIN32
+ #include <direct.h>
+-#include <io.h>
+ #define mkdir_p(path) _mkdir(path)
+ #define PATH_SEP '\\'
+ #else
+ #include <sys/stat.h>
+-#include <unistd.h>
+ #define mkdir_p(path) mkdir(path, 0755)
+ #define PATH_SEP '/'
+ #endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Internal state
+- * -----------------------------------------------------------------------*/
++#define NP_TROPHY_COMM_SIGN_MAGIC 0xB9DDE13Bu
++#define TRP_HEADER_SIZE 0x40u
++#define RTC_TICK_UNIX_EPOCH 62135596800000000ull
+ 
+ static int s_trophy_initialized = 0;
+ static char s_storage_path[512] = "gamedata/trophies";
+ static int  s_storage_path_set = 0;
+ 
+-/* $PS3_GAMEDATA_ROOT (see cellSaveData.c) moves the default next to the saves;
+- * an explicit sceNpTrophySetStoragePath still wins. */
+ static void trophy_adopt_gamedata_root(void)
+ {
+     static int s_done = 0;
+@@ -54,39 +41,62 @@ static void trophy_adopt_gamedata_root(void)
+         snprintf(s_storage_path, sizeof(s_storage_path), "%s/trophies", env);
+ }
+ 
+-/* Per-context data */
+ typedef struct {
+-    int                      in_use;
+-    int                      registered;
+-    SceNpCommunicationId     commId;
+-    u8                       unlocked[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
+-    u64                      unlock_time[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
+-    u32                      total_trophies;
++    int        in_use;
++    int        registered;
++    int        read_only;
++    char       name[16];
++    trp_index  pack;
++    trophy_set set;
++    u8         unlocked[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
++    u64        tick[SCE_NP_TROPHY_MAX_NUM_TROPHIES];
+ } TrophyContext;
+ 
+ typedef struct {
+     int in_use;
+ } TrophyHandle;
+ 
+-/* ID zero is the firmware invalid sentinel; retain all four usable slots. */
+ static TrophyContext s_contexts[SCE_NP_TROPHY_MAX_CONTEXTS + 1];
+ static TrophyHandle  s_handles[SCE_NP_TROPHY_MAX_HANDLES + 1];
+ 
+-/* ---------------------------------------------------------------------------
+- * Persistent storage helpers
+- * -----------------------------------------------------------------------*/
++static u64 rtc_tick_now(void)
++{
++    struct timespec ts;
++    timespec_get(&ts, TIME_UTC);
++    return RTC_TICK_UNIX_EPOCH + (u64)ts.tv_sec * 1000000ull + (u64)ts.tv_nsec / 1000ull;
++}
++
++static void guest_put_string(u32 ea, const char* s, size_t cap)
++{
++    size_t n = strlen(s);
++    if (n >= cap) n = cap - 1;
++    memcpy(vm_base + ea, s, n);
++    vm_base[ea + n] = 0;
++}
++
++static void guest_zero(u32 ea, size_t n)
++{
++    memset(vm_base + ea, 0, n);
++}
++
++static u32 grade_of(char ttype)
++{
++    switch (ttype) {
++    case 'P': return SCE_NP_TROPHY_GRADE_PLATINUM;
++    case 'G': return SCE_NP_TROPHY_GRADE_GOLD;
++    case 'S': return SCE_NP_TROPHY_GRADE_SILVER;
++    case 'B': return SCE_NP_TROPHY_GRADE_BRONZE;
++    default:  return SCE_NP_TROPHY_GRADE_UNKNOWN;
++    }
++}
+ 
+ static void trophy_ensure_dir(void)
+ {
+     char tmp[512];
+-    char* p;
+-
+     trophy_adopt_gamedata_root();
+     strncpy(tmp, s_storage_path, sizeof(tmp) - 1);
+     tmp[sizeof(tmp) - 1] = '\0';
+-
+-    /* Create directories recursively */
+-    for (p = tmp + 1; *p; p++) {
++    for (char* p = tmp + 1; *p; p++) {
+         if (*p == '/' || *p == '\\') {
+             *p = '\0';
+             mkdir_p(tmp);
+@@ -96,96 +106,138 @@ static void trophy_ensure_dir(void)
+     mkdir_p(tmp);
+ }
+ 
+-static void trophy_get_filepath(const SceNpCommunicationId* commId,
+-                                 char* buf, size_t bufsize)
++static void trophy_get_filepath(const TrophyContext* ctx, char* buf, size_t bufsize)
+ {
+     trophy_adopt_gamedata_root();
+-    snprintf(buf, bufsize, "%s/%s.json", s_storage_path, commId->data);
++    snprintf(buf, bufsize, "%s/%s.json", s_storage_path, ctx->name);
+ }
+ 
+-static void trophy_save(TrophyContext* ctx)
++static int trophy_installed(const TrophyContext* ctx)
+ {
+-    char filepath[1024];
+-    FILE* fp;
+-    int first = 1;
++    char path[1024];
++    trophy_get_filepath(ctx, path, sizeof(path));
++    FILE* fp = fopen(path, "r");
++    if (!fp) return 0;
++    fclose(fp);
++    return 1;
++}
+ 
++static int trophy_save(const TrophyContext* ctx)
++{
++    char filepath[1024];
+     trophy_ensure_dir();
+-    trophy_get_filepath(&ctx->commId, filepath, sizeof(filepath));
+-
+-    fp = fopen(filepath, "w");
++    trophy_get_filepath(ctx, filepath, sizeof(filepath));
++    FILE* fp = fopen(filepath, "w");
+     if (!fp) {
+-        printf("[sceNpTrophy] WARNING: Could not save trophies to %s\n",
+-               filepath);
+-        return;
++        printf("[sceNpTrophy] could not save trophies to %s\n", filepath);
++        return 0;
+     }
+-
++    int first = 1;
+     fprintf(fp, "{\n  \"trophies\": [");
+-    for (u32 i = 0; i < ctx->total_trophies; i++) {
+-        if (ctx->unlocked[i]) {
+-            if (!first) fprintf(fp, ",");
+-            fprintf(fp, "\n    { \"id\": %u, \"timestamp\": %llu }",
+-                    i, (unsigned long long)ctx->unlock_time[i]);
+-            first = 0;
+-        }
++    for (int i = 0; i < ctx->set.n; i++) {
++        const int id = ctx->set.t[i].id;
++        if (id < 0 || id >= SCE_NP_TROPHY_MAX_NUM_TROPHIES || !ctx->unlocked[id]) continue;
++        fprintf(fp, "%s\n    { \"id\": %d, \"tick\": %llu }", first ? "" : ",", id,
++                (unsigned long long)ctx->tick[id]);
++        first = 0;
+     }
+     fprintf(fp, "\n  ]\n}\n");
+     fclose(fp);
++    return 1;
+ }
+ 
+ static void trophy_load(TrophyContext* ctx)
+ {
+     char filepath[1024];
+-    FILE* fp;
+     char line[256];
+-
+-    trophy_get_filepath(&ctx->commId, filepath, sizeof(filepath));
+-
+-    fp = fopen(filepath, "r");
+-    if (!fp)
+-        return; /* no saved data, all locked */
+-
+-    /*
+-     * Simple JSON parser -- look for "id": N and "timestamp": T patterns.
+-     * This avoids any external JSON library dependency.
+-     */
++    trophy_get_filepath(ctx, filepath, sizeof(filepath));
++    FILE* fp = fopen(filepath, "r");
++    if (!fp) return;
+     while (fgets(line, sizeof(line), fp)) {
+         const char* id_pos = strstr(line, "\"id\":");
+-        if (id_pos) {
+-            u32 tid = 0;
+-            u64 ts = 0;
+-            const char* ts_pos;
+-
+-            if (sscanf(id_pos, "\"id\": %u", &tid) == 1 &&
+-                tid < SCE_NP_TROPHY_MAX_NUM_TROPHIES) {
+-                ts_pos = strstr(line, "\"timestamp\":");
+-                if (ts_pos)
+-                    sscanf(ts_pos, "\"timestamp\": %llu",
+-                           (unsigned long long*)&ts);
+-                ctx->unlocked[tid] = 1;
+-                ctx->unlock_time[tid] = ts;
+-            }
++        const char* tick_pos = strstr(line, "\"tick\":");
++        unsigned id = 0;
++        unsigned long long tick = 0;
++        if (id_pos && tick_pos && sscanf(id_pos, "\"id\": %u", &id) == 1 &&
++            sscanf(tick_pos, "\"tick\": %llu", &tick) == 1 && id < SCE_NP_TROPHY_MAX_NUM_TROPHIES) {
++            ctx->unlocked[id] = 1;
++            ctx->tick[id] = tick;
+         }
+     }
+     fclose(fp);
++}
++
++static int trophy_pack_open(TrophyContext* ctx)
++{
++    const char* boot = cellGame_get_boot_path();
++    char app[512] = "/dev_bdvd/PS3_GAME/";
++    int from_hdd0 = 0;
++    if (boot && !strncmp(boot, "/dev_hdd0/game/", 15)) {
++        const char* usrdir = strstr(boot + 15, "/USRDIR/");
++        if (usrdir && (size_t)(usrdir - boot) + 2 < sizeof(app)) {
++            memcpy(app, boot, (size_t)(usrdir - boot) + 1);
++            app[usrdir - boot + 1] = 0;
++            from_hdd0 = 1;
++        }
++    }
++    for (int pass = 0; pass < 2; pass++) {
++        char guest[640], host[1024];
++        snprintf(guest, sizeof(guest), "%sTROPDIR/%s/TROPHY.TRP",
++                 pass == 0 ? app : "/dev_bdvd/PS3_GAME/", ctx->name);
++        if (cellfs_translate_path(guest, host, sizeof(host)) == 0 && trp_open(host, &ctx->pack)) {
++            printf("[sceNpTrophy] trophy pack %s\n", guest);
++            return 1;
++        }
++        if (!from_hdd0) break;
++    }
++    return 0;
++}
+ 
+-    printf("[sceNpTrophy] Loaded trophy data from %s\n", filepath);
++static void trophy_set_open(TrophyContext* ctx)
++{
++    char lang_file[32];
++    trophy_lang_file((int)ps3_sysutil_language(), lang_file, sizeof(lang_file));
++    trophy_set_load(&ctx->set, &ctx->pack, lang_file);
+ }
+ 
+-static u32 trophy_count_unlocked(TrophyContext* ctx)
++static const trophy_def* trophy_def_of(const TrophyContext* ctx, s32 id)
+ {
+-    u32 count = 0;
+-    for (u32 i = 0; i < ctx->total_trophies; i++)
+-        if (ctx->unlocked[i]) count++;
+-    return count;
++    return trophy_set_find(&ctx->set, id);
+ }
+ 
+-/* ---------------------------------------------------------------------------
+- * API implementations
+- * -----------------------------------------------------------------------*/
++static s32 trophy_get_context(SceNpTrophyContext context, SceNpTrophyHandle handle,
++                              int writeable, TrophyContext** out)
++{
++    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_contexts[context].in_use)
++        return (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
++    if (writeable && s_contexts[context].read_only)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
++    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_handles[handle].in_use)
++        return (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
++    *out = &s_contexts[context];
++    return CELL_OK;
++}
++
++static s32 trophy_platinum_unlocked_by(const TrophyContext* ctx, s32 trophyId)
++{
++    const trophy_def* d = trophy_def_of(ctx, trophyId);
++    if (!d || d->pid < 0 || d->pid >= SCE_NP_TROPHY_MAX_NUM_TROPHIES || ctx->unlocked[d->pid])
++        return SCE_NP_TROPHY_INVALID_TROPHY_ID;
++    for (int i = 0; i < ctx->set.n; i++) {
++        const trophy_def* t = &ctx->set.t[i];
++        if (t->pid == d->pid && (t->id < 0 || t->id >= SCE_NP_TROPHY_MAX_NUM_TROPHIES || !ctx->unlocked[t->id]))
++            return SCE_NP_TROPHY_INVALID_TROPHY_ID;
++    }
++    return d->pid;
++}
+ 
+ void sceNpTrophySetStoragePath(const char* path)
+ {
+-    path = GUEST_PTR(path, const char*);
++    path = path ? (const char*)(vm_base + (uint32_t)(uintptr_t)path) : NULL;
+     if (path) {
+         strncpy(s_storage_path, path, sizeof(s_storage_path) - 1);
+         s_storage_path[sizeof(s_storage_path) - 1] = '\0';
+@@ -195,13 +247,11 @@ void sceNpTrophySetStoragePath(const char* path)
+ 
+ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
+ {
+-    (void)poolPtr; (void)poolSize; (void)containerId; (void)options;
+-
+-    printf("[sceNpTrophy] Init()\n");
+-
++    (void)poolPtr; (void)poolSize; (void)containerId;
++    if (options > 0)
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
+     if (s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED;
+     memset(s_contexts, 0, sizeof(s_contexts));
+     memset(s_handles, 0, sizeof(s_handles));
+     s_trophy_initialized = 1;
+@@ -210,17 +260,8 @@ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options)
+ 
+ s32 sceNpTrophyTerm(void)
+ {
+-    printf("[sceNpTrophy] Term()\n");
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    /* Save all registered contexts */
+-    for (int i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+-        if (s_contexts[i].in_use && s_contexts[i].registered)
+-            trophy_save(&s_contexts[i]);
+-    }
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+     memset(s_contexts, 0, sizeof(s_contexts));
+     memset(s_handles, 0, sizeof(s_handles));
+     s_trophy_initialized = 0;
+@@ -232,79 +273,79 @@ s32 sceNpTrophyCreateContext(SceNpTrophyContext* context,
+                              const SceNpCommunicationSignature* commSign,
+                              u64 options)
+ {
+-    (void)commSign; (void)options;
+-
++    if (!commSign)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+     if (!context || !commId)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-    const SceNpCommunicationId* commId_h = GUEST_PTR(commId, const SceNpCommunicationId*);
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (options > SCE_NP_TROPHY_OPTIONS_CREATE_CONTEXT_READ_ONLY)
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
++
++    const u32 id_ea = GUEST_EA(commId);
++    const u32 sign_ea = GUEST_EA(commSign);
++    const u8 num = vm_read8(id_ea + offsetof(SceNpCommunicationId, num));
++    if (num > 99)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID;
++    if (vm_read32(sign_ea) != NP_TROPHY_COMM_SIGN_MAGIC || vm_read16(sign_ea + 4) != 0x100)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID;
++    for (u32 i = 6; i < 12; i++)
++        if (vm_read8(sign_ea + i))
++            return (s32)SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID;
++
++    char data[SCE_NP_COMMUNICATION_ID_MAX_LENGTH + 1];
++    memcpy(data, vm_base + id_ea, SCE_NP_COMMUNICATION_ID_MAX_LENGTH);
++    data[SCE_NP_COMMUNICATION_ID_MAX_LENGTH] = 0;
+ 
+     for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+-        if (!s_contexts[i].in_use) {
+-            memset(&s_contexts[i], 0, sizeof(TrophyContext));
+-            s_contexts[i].in_use = 1;
+-            s_contexts[i].commId = *commId_h;
+-            s_contexts[i].total_trophies = SCE_NP_TROPHY_MAX_NUM_TROPHIES;
+-            vm_write32(GUEST_EA(context), (u32)i);
+-            printf("[sceNpTrophy] CreateContext(commId=\"%s\") -> ctx=%d\n",
+-                   commId_h->data, i);
+-            return CELL_OK;
+-        }
++        if (s_contexts[i].in_use) continue;
++        memset(&s_contexts[i], 0, sizeof(TrophyContext));
++        s_contexts[i].in_use = 1;
++        s_contexts[i].read_only = options == SCE_NP_TROPHY_OPTIONS_CREATE_CONTEXT_READ_ONLY;
++        snprintf(s_contexts[i].name, sizeof(s_contexts[i].name), "%s_%02u", data, (unsigned)num);
++        vm_write32(GUEST_EA(context), (u32)i);
++        printf("[sceNpTrophy] CreateContext(%s) -> ctx=%d\n", s_contexts[i].name, i);
++        return CELL_OK;
+     }
+-
+-    return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
++    return (s32)SCE_NP_TROPHY_ERROR_EXCEEDS_MAX;
+ }
+ 
+ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context)
+ {
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (s_contexts[context].registered)
+-        trophy_save(&s_contexts[context]);
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_contexts[context].in_use)
++        return (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT;
+     s_contexts[context].in_use = 0;
+-    printf("[sceNpTrophy] DestroyContext(ctx=%d)\n", context);
+     return CELL_OK;
+ }
+ 
+ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle)
+ {
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+     if (!handle)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+     for (s32 i = 1; i <= SCE_NP_TROPHY_MAX_HANDLES; i++) {
+-        if (!s_handles[i].in_use) {
+-            s_handles[i].in_use = 1;
+-            vm_write32(GUEST_EA(handle), (u32)i);
+-            printf("[sceNpTrophy] CreateHandle() -> handle=%d\n", i);
+-            return CELL_OK;
+-        }
++        if (s_handles[i].in_use) continue;
++        s_handles[i].in_use = 1;
++        vm_write32(GUEST_EA(handle), (u32)i);
++        return CELL_OK;
+     }
+-
+-    return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
++    return (s32)SCE_NP_TROPHY_ERROR_EXCEEDS_MAX;
+ }
+ 
+ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle)
+ {
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
+-        !s_handles[handle].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!s_handles[handle].in_use)
++        return (s32)SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE;
+     s_handles[handle].in_use = 0;
+-    printf("[sceNpTrophy] DestroyHandle(handle=%d)\n", handle);
+     return CELL_OK;
+ }
+ 
+@@ -314,48 +355,61 @@ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
+                                u32 arg,
+                                u64 options)
+ {
+-    (void)options;
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (handle <= 0 || handle > SCE_NP_TROPHY_MAX_HANDLES ||
+-        !s_handles[handle].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+-
+-    if (s_contexts[context].registered)
+-        return SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG;
+-
+-    if (!statusCb) return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-    if (!g_ps3_guest_caller) return SCE_NP_TROPHY_ERROR_UNKNOWN;
+-
+-    /* Load any previously saved trophy data */
+-    trophy_load(&s_contexts[context]);
+-    s_contexts[context].registered = 1;
+-
+-    printf("[sceNpTrophy] RegisterContext(ctx=%d, handle=%d, statusCb=0x%08X, "
+-           "arg=0x%08X) -> loaded saved data\n", context, handle, statusCb, arg);
+-
+-    /* Use the runner's OPD bridge, not the optional code/TOC scaffold entry
+-     * point. Registration status is synchronous; its terminal notification is
+-     * delivered through sysutil polling, after the HLE storage load completes.
+-     * Intermediate firmware installation progress is not simulated here. */
+-    g_ps3_guest_caller(statusCb, (u32)context, SCE_NP_TROPHY_STATUS_INSTALLED,
+-                       0, 0, arg, 0, 0, 0);
+-    if (!s_trophy_initialized) return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-    if (!s_contexts[context].in_use) return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-    if (!s_handles[handle].in_use) return SCE_NP_TROPHY_ERROR_INVALID_HANDLE;
+-    const u64 completion[8] = {(u32)context, SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE,
+-                               0, 0, arg, 0, 0, 0};
+-    if (cellSysutilQueueGuestCallbackArgs(statusCb, completion) != CELL_OK) {
+-        s_contexts[context].registered = 0;
+-        return SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 1, &ctx);
++    if (err) return err;
++    if (!statusCb)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (options > SCE_NP_TROPHY_OPTIONS_REGISTER_CONTEXT_SHOW_ERROR_EXIT)
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
++
++    if (!trophy_pack_open(ctx)) {
++        printf("[sceNpTrophy] RegisterContext(%s): no TROPHY.TRP\n", ctx->name);
++        return (s32)SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST;
+     }
+ 
++    const u32 status = trophy_installed(ctx) ? SCE_NP_TROPHY_STATUS_INSTALLED
++                                             : SCE_NP_TROPHY_STATUS_NOT_INSTALLED;
++    uint64_t r3 = 0;
++    if (!ppu_guest_call_ct_checked(vm_read32(statusCb), vm_read32(statusCb + 4),
++                                   (u32)context, status, 0, 0, arg, 0, 0, 0, &r3))
++        return (s32)SCE_NP_TROPHY_ERROR_UNKNOWN;
++    if ((s32)(u32)r3 < 0)
++        return (s32)SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED;
++
++    err = trophy_get_context(context, handle, 1, &ctx);
++    if (err) return err;
++
++    trophy_set_open(ctx);
++    if (ctx->set.n <= 0 || ctx->set.n > SCE_NP_TROPHY_MAX_NUM_TROPHIES) {
++        printf("[sceNpTrophy] RegisterContext(%s): %s holds no usable trophy list\n", ctx->name, ctx->pack.path);
++        return (s32)SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE;
++    }
++    memset(ctx->unlocked, 0, sizeof(ctx->unlocked));
++    memset(ctx->tick, 0, sizeof(ctx->tick));
++    trophy_load(ctx);
++    if (!trophy_save(ctx))
++        return (s32)SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE;
++    ctx->registered = 1;
++    printf("[sceNpTrophy] RegisterContext(%s): %d trophies, \"%s\"\n", ctx->name, ctx->set.n, ctx->set.title);
++
++    const s32 progress = ctx->set.n - 1;
++    const struct { u32 status; s32 total; } steps[] = {
++        { SCE_NP_TROPHY_STATUS_PROCESSING_SETUP,    3 },
++        { SCE_NP_TROPHY_STATUS_PROCESSING_PROGRESS, progress },
++        { SCE_NP_TROPHY_STATUS_PROCESSING_FINALIZE, (progress > 9 ? progress : 9) - 5 },
++        { SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE, 0 },
++    };
++    for (unsigned s = 0; s < sizeof(steps) / sizeof(steps[0]); s++) {
++        for (s32 done = 0; done <= steps[s].total; done++) {
++            const u64 args[8] = { (u32)context, steps[s].status, (u64)(u32)done,
++                                  (u64)(u32)steps[s].total, arg, 0, 0, 0 };
++            if (cellSysutilQueueGuestCallbackArgs(statusCb, args) != CELL_OK)
++                return (s32)SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY;
++        }
++    }
+     return CELL_OK;
+ }
+ 
+@@ -363,28 +417,24 @@ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
+                                     SceNpTrophyHandle handle,
+                                     u64* reqSpace, u64 options)
+ {
+-    (void)handle; (void)options;
+-
++    if (options > 0)
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_SUPPORTED;
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 0, &ctx);
++    if (err) return err;
+     if (!reqSpace)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-    reqSpace = GUEST_PTR(reqSpace, u64*);
+-
+-    /* Typical trophy pack size. The guest is big-endian and reads this u64
+-     * back in BE order, so the value MUST be byte-swapped on write -- otherwise
+-     * a host-LE 0x100000 is read as 0x0010000000000000 (2^44). LBP feeds this
+-     * "required disk space" straight into its save-data free-space accounting
+-     * (sub_379EC0: errB = budget - usedKB - reqSpaceKB); a garbage 2^44 makes
+-     * errB underflow negative -> cellGame GameData check returns ERROR-B ->
+-     * boot bails. (Same LE-write class as the cellUserInfo fix.) */
+-    *reqSpace = ps3_bswap64((u64)(1024 * 1024)); /* 1 MB, big-endian */
+-    printf("[sceNpTrophy] GetRequiredDiskSpace(ctx=%d) -> 1MB\n", context);
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++
++    u64 space = 0;
++    if (!trophy_installed(ctx)) {
++        if (!trophy_pack_open(ctx))
++            return (s32)SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST;
++        space = ctx->pack.file_size - TRP_HEADER_SIZE -
++                (u64)ctx->pack.entry_count * ctx->pack.entry_size;
++    }
++    vm_write64(GUEST_EA(reqSpace), space);
+     return CELL_OK;
+ }
+ 
+@@ -393,45 +443,49 @@ s32 sceNpTrophyGetGameInfo(SceNpTrophyContext context,
+                            SceNpTrophyGameDetails* details,
+                            SceNpTrophyGameData* data)
+ {
+-    (void)handle;
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (!s_contexts[context].registered)
+-        return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+-    details = GUEST_PTR(details, SceNpTrophyGameDetails*);
+-    data = GUEST_PTR(data, SceNpTrophyGameData*);
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 0, &ctx);
++    if (err) return err;
++    if (!ctx->registered)
++        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
++    if (!details && !data)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++
++    u32 count[5] = {0}, unlocked[5] = {0};
++    for (int i = 0; i < ctx->set.n; i++) {
++        const trophy_def* t = &ctx->set.t[i];
++        const u32 g = grade_of(t->grade);
++        count[0]++;
++        if (g) count[g]++;
++        if (t->id >= 0 && t->id < SCE_NP_TROPHY_MAX_NUM_TROPHIES && ctx->unlocked[t->id]) {
++            unlocked[0]++;
++            if (g) unlocked[g]++;
++        }
++    }
+ 
+     if (details) {
+-        memset(details, 0, sizeof(SceNpTrophyGameDetails));
+-        details->numTrophies = 32; /* default trophy set */
+-        details->numPlatinum = 1;
+-        details->numGold     = 2;
+-        details->numSilver   = 8;
+-        details->numBronze   = 21;
+-        strncpy(details->title, "PS3 Game",
+-                SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE - 1);
+-        strncpy(details->description, "Trophy set",
+-                SCE_NP_TROPHY_GAME_DESC_MAX_SIZE - 1);
++        const u32 ea = GUEST_EA(details);
++        guest_zero(ea, sizeof(SceNpTrophyGameDetails));
++        vm_write32(ea + offsetof(SceNpTrophyGameDetails, numTrophies), count[0]);
++        vm_write32(ea + offsetof(SceNpTrophyGameDetails, numPlatinum), count[SCE_NP_TROPHY_GRADE_PLATINUM]);
++        vm_write32(ea + offsetof(SceNpTrophyGameDetails, numGold), count[SCE_NP_TROPHY_GRADE_GOLD]);
++        vm_write32(ea + offsetof(SceNpTrophyGameDetails, numSilver), count[SCE_NP_TROPHY_GRADE_SILVER]);
++        vm_write32(ea + offsetof(SceNpTrophyGameDetails, numBronze), count[SCE_NP_TROPHY_GRADE_BRONZE]);
++        guest_put_string(ea + offsetof(SceNpTrophyGameDetails, title), ctx->set.title,
++                         SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE);
++        guest_put_string(ea + offsetof(SceNpTrophyGameDetails, description), ctx->set.title_detail,
++                         SCE_NP_TROPHY_GAME_DESC_MAX_SIZE);
+     }
+-
+     if (data) {
+-        memset(data, 0, sizeof(SceNpTrophyGameData));
+-        data->unlockedTrophies = trophy_count_unlocked(&s_contexts[context]);
+-        /* Count by grade would require per-trophy grade data;
+-         * return conservative estimates */
+-        data->unlockedPlatinum = 0;
+-        data->unlockedGold     = 0;
+-        data->unlockedSilver   = 0;
+-        data->unlockedBronze   = data->unlockedTrophies;
++        const u32 ea = GUEST_EA(data);
++        vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedTrophies), unlocked[0]);
++        vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedPlatinum), unlocked[SCE_NP_TROPHY_GRADE_PLATINUM]);
++        vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedGold), unlocked[SCE_NP_TROPHY_GRADE_GOLD]);
++        vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedSilver), unlocked[SCE_NP_TROPHY_GRADE_SILVER]);
++        vm_write32(ea + offsetof(SceNpTrophyGameData, unlockedBronze), unlocked[SCE_NP_TROPHY_GRADE_BRONZE]);
+     }
+-
+-    printf("[sceNpTrophy] GetGameInfo(ctx=%d)\n", context);
+     return CELL_OK;
+ }
+ 
+@@ -441,41 +495,39 @@ s32 sceNpTrophyGetTrophyInfo(SceNpTrophyContext context,
+                              SceNpTrophyDetails* details,
+                              SceNpTrophyData* data)
+ {
+-    (void)handle;
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (!s_contexts[context].registered)
+-        return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+-
+-    if (trophyId < 0 || (u32)trophyId >= s_contexts[context].total_trophies)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-    details = GUEST_PTR(details, SceNpTrophyDetails*);
+-    data = GUEST_PTR(data, SceNpTrophyData*);
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 0, &ctx);
++    if (err) return err;
++    if (!details && !data)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!ctx->registered)
++        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
++
++    const trophy_def* t = trophy_def_of(ctx, trophyId);
++    if (!t || trophyId >= SCE_NP_TROPHY_MAX_NUM_TROPHIES)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
++    const int unlocked = ctx->unlocked[trophyId];
++    if (t->hidden && !unlocked)
++        return (s32)SCE_NP_TROPHY_ERROR_HIDDEN;
+ 
+     if (details) {
+-        memset(details, 0, sizeof(SceNpTrophyDetails));
+-        details->trophyId = (u32)trophyId;
+-        details->trophyGrade = SCE_NP_TROPHY_GRADE_BRONZE;
+-        snprintf(details->name, SCE_NP_TROPHY_NAME_MAX_SIZE,
+-                 "Trophy %d", trophyId);
+-        snprintf(details->description, SCE_NP_TROPHY_DESC_MAX_SIZE,
+-                 "Trophy #%d description", trophyId);
+-        details->hidden = 0;
++        const u32 ea = GUEST_EA(details);
++        guest_zero(ea, sizeof(SceNpTrophyDetails));
++        vm_write32(ea + offsetof(SceNpTrophyDetails, trophyId), (u32)trophyId);
++        vm_write32(ea + offsetof(SceNpTrophyDetails, trophyGrade), grade_of(t->grade));
++        guest_put_string(ea + offsetof(SceNpTrophyDetails, name), t->name, SCE_NP_TROPHY_NAME_MAX_SIZE);
++        guest_put_string(ea + offsetof(SceNpTrophyDetails, description), t->detail, SCE_NP_TROPHY_DESC_MAX_SIZE);
++        vm_write8(ea + offsetof(SceNpTrophyDetails, hidden), t->hidden ? 1 : 0);
+     }
+-
+     if (data) {
+-        memset(data, 0, sizeof(SceNpTrophyData));
+-        data->trophyId = (u32)trophyId;
+-        data->unlocked = s_contexts[context].unlocked[trophyId];
+-        data->timestamp = s_contexts[context].unlock_time[trophyId];
++        const u32 ea = GUEST_EA(data);
++        guest_zero(ea, sizeof(SceNpTrophyData));
++        vm_write64(ea + offsetof(SceNpTrophyData, timestamp), ctx->tick[trophyId]);
++        vm_write32(ea + offsetof(SceNpTrophyData, trophyId), (u32)trophyId);
++        vm_write8(ea + offsetof(SceNpTrophyData, unlocked), unlocked ? 1 : 0);
+     }
+-
+     return CELL_OK;
+ }
+ 
+@@ -484,44 +536,36 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
+                             SceNpTrophyId trophyId,
+                             SceNpTrophyId* platinumId)
+ {
+-    (void)handle;
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (!s_contexts[context].registered)
+-        return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+-
+-    if (trophyId < 0 || (u32)trophyId >= s_contexts[context].total_trophies)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-
+-    if (s_contexts[context].unlocked[trophyId])
+-        return SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED;
+-
+-    /* Unlock the trophy */
+-    s_contexts[context].unlocked[trophyId] = 1;
+-    s_contexts[context].unlock_time[trophyId] = (u64)time(NULL);
+-
+-    printf("************************************************************\n");
+-    printf("*  TROPHY UNLOCKED!  Trophy #%d                            \n",
+-           trophyId);
+-    printf("*  Context: %d  CommId: %s                                 \n",
+-           context, s_contexts[context].commId.data);
+-    printf("************************************************************\n");
+-
+-    /* Save immediately */
+-    trophy_save(&s_contexts[context]);
+-
+-    /* Check if all non-platinum trophies are unlocked -> platinum */
+-    if (platinumId) {
+-        vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
+-        /* Simplified: don't auto-award platinum without grade info */
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 1, &ctx);
++    if (err) return err;
++    if (!ctx->registered)
++        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
++
++    const trophy_def* t = trophy_def_of(ctx, trophyId);
++    if (trophyId < 0 || trophyId >= ctx->set.n || trophyId >= SCE_NP_TROPHY_MAX_NUM_TROPHIES || !t)
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID;
++    if (grade_of(t->grade) == SCE_NP_TROPHY_GRADE_PLATINUM)
++        return (s32)SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM;
++    if (ctx->unlocked[trophyId])
++        return (s32)SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED;
++
++    const u64 now = rtc_tick_now();
++    ctx->unlocked[trophyId] = 1;
++    ctx->tick[trophyId] = now;
++    printf("[sceNpTrophy] trophy %d unlocked: %s\n", trophyId, t->name);
++
++    const s32 plat = trophy_platinum_unlocked_by(ctx, trophyId);
++    if (plat != SCE_NP_TROPHY_INVALID_TROPHY_ID) {
++        ctx->unlocked[plat] = 1;
++        ctx->tick[plat] = now;
++        printf("[sceNpTrophy] platinum trophy %d unlocked\n", plat);
+     }
+-
++    if (platinumId)
++        vm_write32(GUEST_EA(platinumId), (u32)plat);
++    trophy_save(ctx);
+     return CELL_OK;
+ }
+ 
+@@ -530,34 +574,25 @@ s32 sceNpTrophyGetTrophyUnlockState(SceNpTrophyContext context,
+                                     SceNpTrophyFlagArray* flags,
+                                     u32* count)
+ {
+-    (void)handle;
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (!s_contexts[context].registered)
+-        return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 0, &ctx);
++    if (err) return err;
+     if (!flags || !count)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-
+-    u32 flags_ea = (u32)(uintptr_t)flags;
+-    for (u32 o = 0; o < sizeof(SceNpTrophyFlagArray); o += 4)
+-        vm_write32(flags_ea + o, 0);
+-
+-    for (u32 i = 0; i < s_contexts[context].total_trophies; i++) {
+-        if (s_contexts[context].unlocked[i])
+-            {
+-            u32 word_ea = flags_ea + (i / 32) * 4;
+-            vm_write32(word_ea, vm_read32(word_ea) | (1u << (i % 32)));
+-        }
+-    }
+-
+-    vm_write32((u32)(uintptr_t)count, (u32)s_contexts[context].total_trophies);
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!ctx->registered)
++        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
++
++    const u32 n = (u32)ctx->set.n;
++    vm_write32(GUEST_EA(count), n);
++    u32 bits[SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32] = {0};
++    for (u32 id = 0; id < n && id < SCE_NP_TROPHY_MAX_NUM_TROPHIES; id++)
++        if (ctx->unlocked[id])
++            bits[id / 32] |= 1u << (id % 32);
++    const u32 ea = GUEST_EA(flags);
++    for (u32 w = 0; w < SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32; w++)
++        vm_write32(ea + w * 4, bits[w]);
+     return CELL_OK;
+ }
+ 
+@@ -565,28 +600,21 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
+                                SceNpTrophyHandle handle,
+                                s32* percentage)
+ {
+-    (void)handle;
+-
+     if (!s_trophy_initialized)
+-        return SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
+-
+-    if (context <= 0 || context > SCE_NP_TROPHY_MAX_CONTEXTS ||
+-        !s_contexts[context].in_use)
+-        return SCE_NP_TROPHY_ERROR_INVALID_CONTEXT;
+-
+-    if (!s_contexts[context].registered)
+-        return SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
+-
++        return (s32)SCE_NP_TROPHY_ERROR_NOT_INITIALIZED;
++    TrophyContext* ctx;
++    s32 err = trophy_get_context(context, handle, 0, &ctx);
++    if (err) return err;
+     if (!percentage)
+-        return SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
+-
+-    u32 total = s_contexts[context].total_trophies;
+-    u32 unlocked = trophy_count_unlocked(&s_contexts[context]);
+-
+-    s32 pct = total > 0 ? (s32)((unlocked * 100) / total) : 0;
+-    vm_write32(GUEST_EA(percentage), (u32)pct);
+-
+-    printf("[sceNpTrophy] GetGameProgress(ctx=%d) -> %d%%\n",
+-           context, pct);
++        return (s32)SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT;
++    if (!ctx->registered)
++        return (s32)SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED;
++
++    u32 unlocked = 0;
++    const u32 n = (u32)ctx->set.n;
++    for (u32 id = 0; id < n && id < SCE_NP_TROPHY_MAX_NUM_TROPHIES; id++)
++        unlocked += ctx->unlocked[id] ? 1u : 0u;
++    const u32 pct = n ? (unlocked * 100u + n / 2u) / n : 0u;
++    vm_write32(GUEST_EA(percentage), pct);
+     return CELL_OK;
+ }
+diff --git a/libs/network/sceNpTrophy.h b/libs/network/sceNpTrophy.h
+index 48faefdc..1d1f29de 100644
+--- a/libs/network/sceNpTrophy.h
++++ b/libs/network/sceNpTrophy.h
+@@ -15,70 +15,91 @@
+ extern "C" {
+ #endif
+ 
+-/* ---------------------------------------------------------------------------
+- * Error codes
+- * -----------------------------------------------------------------------*/
+-#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED         0x80551601
+-#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED     0x80551602
+-#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT        0x80551603
+-#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY           0x80551604
+-#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT         0x80551605
+-#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE          0x80551606
+-#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED  0x80551607
+-#define SCE_NP_TROPHY_ERROR_ALREADY_EXISTS          0x80551608
+-#define SCE_NP_TROPHY_ERROR_NOT_FOUND               0x80551609
+-#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED        0x8055160A
+-#define SCE_NP_TROPHY_ERROR_PLATINUM_CANNOT_UNLOCK  0x8055160B
+-#define SCE_NP_TROPHY_ERROR_CONTEXT_ALREADY_REG     0x8055160C
+-#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_SPACE      0x8055160D
+-#define SCE_NP_TROPHY_ERROR_PROCESSING              0x8055160E
+-#define SCE_NP_TROPHY_ERROR_ABORT                   0x8055160F
+-#define SCE_NP_TROPHY_ERROR_UNKNOWN                 0x805516FF
+-
+-/* ---------------------------------------------------------------------------
+- * Constants
+- * -----------------------------------------------------------------------*/
++#define SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED          0x80022901
++#define SCE_NP_TROPHY_ERROR_NOT_INITIALIZED              0x80022902
++#define SCE_NP_TROPHY_ERROR_NOT_SUPPORTED                0x80022903
++#define SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED       0x80022904
++#define SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY                0x80022905
++#define SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT             0x80022906
++#define SCE_NP_TROPHY_ERROR_EXCEEDS_MAX                  0x80022907
++#define SCE_NP_TROPHY_ERROR_INSUFFICIENT                 0x80022909
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT              0x8002290A
++#define SCE_NP_TROPHY_ERROR_INVALID_FORMAT               0x8002290B
++#define SCE_NP_TROPHY_ERROR_BAD_RESPONSE                 0x8002290C
++#define SCE_NP_TROPHY_ERROR_INVALID_GRADE                0x8002290D
++#define SCE_NP_TROPHY_ERROR_INVALID_CONTEXT              0x8002290E
++#define SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED           0x8002290F
++#define SCE_NP_TROPHY_ERROR_ABORT                        0x80022910
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE               0x80022911
++#define SCE_NP_TROPHY_ERROR_LOCKED                       0x80022912
++#define SCE_NP_TROPHY_ERROR_HIDDEN                       0x80022913
++#define SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM       0x80022914
++#define SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED             0x80022915
++#define SCE_NP_TROPHY_ERROR_INVALID_TYPE                 0x80022916
++#define SCE_NP_TROPHY_ERROR_INVALID_HANDLE               0x80022917
++#define SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID           0x80022918
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_NP_COMM_ID           0x80022919
++#define SCE_NP_TROPHY_ERROR_DISC_IO                      0x8002291A
++#define SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST          0x8002291B
++#define SCE_NP_TROPHY_ERROR_UNSUPPORTED_FORMAT           0x8002291C
++#define SCE_NP_TROPHY_ERROR_ALREADY_INSTALLED            0x8002291D
++#define SCE_NP_TROPHY_ERROR_BROKEN_DATA                  0x8002291E
++#define SCE_NP_TROPHY_ERROR_VERIFICATION_FAILURE         0x8002291F
++#define SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID            0x80022920
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_TROPHY_ID            0x80022921
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_TITLE                0x80022922
++#define SCE_NP_TROPHY_ERROR_UNKNOWN_FILE                 0x80022923
++#define SCE_NP_TROPHY_ERROR_DISC_NOT_MOUNTED             0x80022924
++#define SCE_NP_TROPHY_ERROR_SHUTDOWN                     0x80022925
++#define SCE_NP_TROPHY_ERROR_TITLE_ICON_NOT_FOUND         0x80022926
++#define SCE_NP_TROPHY_ERROR_TROPHY_ICON_NOT_FOUND        0x80022927
++#define SCE_NP_TROPHY_ERROR_INSUFFICIENT_DISK_SPACE      0x80022928
++#define SCE_NP_TROPHY_ERROR_ILLEGAL_UPDATE               0x8002292A
++#define SCE_NP_TROPHY_ERROR_SAVEDATA_USER_DOES_NOT_MATCH 0x8002292B
++#define SCE_NP_TROPHY_ERROR_TROPHY_ID_DOES_NOT_EXIST     0x8002292C
++#define SCE_NP_TROPHY_ERROR_SERVICE_UNAVAILABLE          0x8002292D
++#define SCE_NP_TROPHY_ERROR_UNKNOWN                      0x800229FF
++
+ #define SCE_NP_TROPHY_INVALID_CONTEXT       ((SceNpTrophyContext)0)
+ #define SCE_NP_TROPHY_INVALID_HANDLE        ((SceNpTrophyHandle)0)
+ #define SCE_NP_TROPHY_INVALID_TROPHY_ID     ((SceNpTrophyId)-1)
+ 
+ #define SCE_NP_TROPHY_MAX_NUM_TROPHIES      128
+ #define SCE_NP_TROPHY_NAME_MAX_SIZE         128
+-#define SCE_NP_TROPHY_DESC_MAX_SIZE         256
++#define SCE_NP_TROPHY_DESC_MAX_SIZE         1024
+ #define SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE   128
+ #define SCE_NP_TROPHY_GAME_DESC_MAX_SIZE    1024
+ 
+ #define SCE_NP_TROPHY_MAX_CONTEXTS          4
+ #define SCE_NP_TROPHY_MAX_HANDLES           4
+ 
+-/* Trophy grades */
++#define SCE_NP_TROPHY_OPTIONS_CREATE_CONTEXT_READ_ONLY        1
++#define SCE_NP_TROPHY_OPTIONS_REGISTER_CONTEXT_SHOW_ERROR_EXIT 1
++
+ #define SCE_NP_TROPHY_GRADE_UNKNOWN         0
+ #define SCE_NP_TROPHY_GRADE_PLATINUM        1
+ #define SCE_NP_TROPHY_GRADE_GOLD            2
+ #define SCE_NP_TROPHY_GRADE_SILVER          3
+ #define SCE_NP_TROPHY_GRADE_BRONZE          4
+ 
+-/* ---------------------------------------------------------------------------
+- * Types
+- * -----------------------------------------------------------------------*/
+ typedef s32 SceNpTrophyContext;
+ typedef s32 SceNpTrophyHandle;
+ typedef s32 SceNpTrophyId;
+ 
+ typedef struct SceNpTrophyDetails {
+-    u32  trophyId;
++    s32  trophyId;
+     u32  trophyGrade;
+     char name[SCE_NP_TROPHY_NAME_MAX_SIZE];
+     char description[SCE_NP_TROPHY_DESC_MAX_SIZE];
+     u8   hidden;
+-    u8   padding[3];
++    u8   reserved[3];
+ } SceNpTrophyDetails;
+ 
+ typedef struct SceNpTrophyData {
+-    u64  timestamp;     /* UNIX timestamp when unlocked, 0 if locked */
+-    u32  trophyId;
++    u64  timestamp;
++    s32  trophyId;
+     u8   unlocked;
+-    u8   padding[3];
++    u8   reserved[3];
+ } SceNpTrophyData;
+ 
+ typedef struct SceNpTrophyGameDetails {
+@@ -89,6 +110,7 @@ typedef struct SceNpTrophyGameDetails {
+     u32  numBronze;
+     char title[SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE];
+     char description[SCE_NP_TROPHY_GAME_DESC_MAX_SIZE];
++    u8   reserved[4];
+ } SceNpTrophyGameDetails;
+ 
+ typedef struct SceNpTrophyGameData {
+@@ -99,15 +121,10 @@ typedef struct SceNpTrophyGameData {
+     u32  unlockedBronze;
+ } SceNpTrophyGameData;
+ 
+-/* Bitfield for trophy unlock state: 1 bit per trophy */
+ typedef struct SceNpTrophyFlagArray {
+     u32 flag[SCE_NP_TROPHY_MAX_NUM_TROPHIES / 32];
+ } SceNpTrophyFlagArray;
+ 
+-/* ---------------------------------------------------------------------------
+- * Functions
+- * -----------------------------------------------------------------------*/
+-
+ s32 sceNpTrophyInit(void* poolPtr, u32 poolSize, u32 containerId, u64 options);
+ s32 sceNpTrophyTerm(void);
+ 
+@@ -120,22 +137,22 @@ s32 sceNpTrophyDestroyContext(SceNpTrophyContext context);
+ s32 sceNpTrophyCreateHandle(SceNpTrophyHandle* handle);
+ s32 sceNpTrophyDestroyHandle(SceNpTrophyHandle handle);
+ 
+-/* Real ABI: (context, handle, statusCb, arg, options).  statusCb is a guest
+- * OPD for SceNpTrophyStatusCallback(context, status, completed, total, arg);
+- * the game blocks on registration-complete which is signalled via this cb. */
+ s32 sceNpTrophyRegisterContext(SceNpTrophyContext context,
+                                SceNpTrophyHandle handle,
+                                u32 statusCb,
+                                u32 arg,
+                                u64 options);
+ 
+-/* SceNpTrophyStatus values fired to the status callback */
+-#define SCE_NP_TROPHY_STATUS_UNKNOWN            0
+-#define SCE_NP_TROPHY_STATUS_NOT_INSTALLED      1
+-#define SCE_NP_TROPHY_STATUS_DATA_CORRUPT       2
+-#define SCE_NP_TROPHY_STATUS_INSTALLED          3
+-#define SCE_NP_TROPHY_STATUS_REQUIRES_UPDATE    4
++#define SCE_NP_TROPHY_STATUS_UNKNOWN             0
++#define SCE_NP_TROPHY_STATUS_NOT_INSTALLED       1
++#define SCE_NP_TROPHY_STATUS_DATA_CORRUPT        2
++#define SCE_NP_TROPHY_STATUS_INSTALLED           3
++#define SCE_NP_TROPHY_STATUS_REQUIRES_UPDATE     4
++#define SCE_NP_TROPHY_STATUS_PROCESSING_SETUP    5
++#define SCE_NP_TROPHY_STATUS_PROCESSING_PROGRESS 6
++#define SCE_NP_TROPHY_STATUS_PROCESSING_FINALIZE 7
+ #define SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE 8
++#define SCE_NP_TROPHY_STATUS_CHANGES_DETECTED    9
+ 
+ s32 sceNpTrophyGetRequiredDiskSpace(SceNpTrophyContext context,
+                                     SceNpTrophyHandle handle,
+@@ -166,7 +183,6 @@ s32 sceNpTrophyGetGameProgress(SceNpTrophyContext context,
+                                SceNpTrophyHandle handle,
+                                s32* percentage);
+ 
+-/* Set the trophy storage directory (defaults to "gamedata/trophies") */
+ void sceNpTrophySetStoragePath(const char* path);
+ 
+ #ifdef __cplusplus
+diff --git a/libs/network/tests/test_trophy_registration.c b/libs/network/tests/test_trophy_registration.c
+index b08a5b24..cf8783b4 100644
+--- a/libs/network/tests/test_trophy_registration.c
++++ b/libs/network/tests/test_trophy_registration.c
+@@ -2,7 +2,9 @@
+  * libs/system/cellSysutil.c -Wl,-dead_strip -pthread -o /tmp/test_trophy_registration
+  */
+ #include "../sceNpTrophy.c"
++#include "../trophy_files.c"
+ #include <assert.h>
++#include <unistd.h>
+ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+ int g_resv_store_active;
+@@ -13,39 +15,109 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
+-/* g_ps3_guest_caller is cellSysutil.c's (defining it here too is a duplicate
+- * symbol under gcc). cellSysutilCheckCallback also pumps the message dialog,
+- * the PSN room transport and the PSN terms check; none is under test here. */
+ void cellMsgDialog_tick(void) {}
+ void np_psnr_pump(void) {}
+ void ps3_np_eula_tick(void) {}
+-static unsigned calls;
++#include "trophy_fixture.h"
++
++static unsigned sync_calls;
++static u32 sync_status;
++static s32 sync_result;
++int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc, uint64_t a0, uint64_t a1, uint64_t a2,
++                              uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
++                              uint64_t* result)
++{
++    assert(code == 0x1234 && toc == 0x5678 && a0 == 1 && a4 == 0xCAFE);
++    assert(!a2 && !a3 && !a5 && !a6 && !a7);
++    sync_status = (u32)a1;
++    sync_calls++;
++    *result = (uint64_t)(int64_t)sync_result;
++    return 1;
++}
++
++static unsigned events;
++static u32 last_status, last_completed, last_total;
+ static void callback(u32 opd, u64 context, u64 status, u64 completed, u64 total,
+                      u64 arg, u64 a, u64 b, u64 c)
+ {
+-    assert(opd == 0x300 && context == 1 && arg == 0xCAFE);
+-    assert(!completed && !total && !a && !b && !c);
+-    assert(status == (calls ? 8 : 3)); calls++;
++    assert(opd == 0x300 && context == 1 && arg == 0xCAFE && !a && !b && !c);
++    assert(status >= last_status);
++    last_status = (u32)status; last_completed = (u32)completed; last_total = (u32)total;
++    events++;
+ }
++
+ int main(void)
+ {
+-    char root[] = "/tmp/ps3recomp-trophy-XXXXXX";
+-    assert(mkdtemp(root));
++    snprintf(g_fixture_root, sizeof g_fixture_root, "/tmp/ps3recomp-trophy-reg-XXXXXX");
++    assert(mkdtemp(g_fixture_root));
+     vm_base = calloc(1, 65536); assert(vm_base);
+-    strcpy((char*)vm_base + 0x400, root);
++    strcpy((char*)vm_base + 0x400, g_fixture_root);
+     sceNpTrophySetStoragePath((void*)0x400);
+-    memcpy(vm_base + 0x100, "NPWR00000", 10);
++    memcpy(vm_base + 0x100, "NPWR00000", 9);
++    fixture_guest_sign(0x180);
++    vm_write32(0x300, 0x1234); vm_write32(0x304, 0x5678);
++    g_ps3_guest_caller = callback;
++
+     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
+-    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
++    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x180, 0) == CELL_OK);
++    assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
++    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_CONF_DOES_NOT_EXIST);
++    assert(!sync_calls);
++
++    fixture_write_pack();
++    sync_result = -1;
++    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_PROCESSING_ABORTED);
++    assert(sync_calls == 1 && sync_status == SCE_NP_TROPHY_STATUS_NOT_INSTALLED && !s_contexts[1].registered);
++
++    sync_result = 0;
++    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == CELL_OK);
++    assert(sync_calls == 2 && sync_status == SCE_NP_TROPHY_STATUS_NOT_INSTALLED && s_contexts[1].registered);
++    cellSysutilCheckCallback();
++    assert(events == 4 + 3 + 5 + 1);
++    assert(last_status == SCE_NP_TROPHY_STATUS_PROCESSING_COMPLETE && !last_completed && !last_total);
++
++    assert(sceNpTrophyGetGameInfo(1, 1, (void*)0x1000, (void*)0x2000) == CELL_OK);
++    assert(vm_read32(0x1000) == 3 && vm_read32(0x1004) == 1 && vm_read32(0x1008) == 1);
++    assert(vm_read32(0x100C) == 0 && vm_read32(0x1010) == 1);
++    assert(!strcmp((char*)vm_base + 0x1014, "Fixture & Co"));
++    assert(!strcmp((char*)vm_base + 0x1014 + SCE_NP_TROPHY_GAME_TITLE_MAX_SIZE, "Trophies for the fixture."));
++    assert(vm_read32(0x2000) == 0);
++
++    assert(sceNpTrophyGetTrophyInfo(1, 1, 2, (void*)0x3000, NULL) == SCE_NP_TROPHY_ERROR_HIDDEN);
++    assert(sceNpTrophyGetTrophyInfo(1, 1, 3, (void*)0x3000, NULL) == SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID);
++    assert(sceNpTrophyGetTrophyInfo(1, 1, 1, (void*)0x3000, (void*)0x3800) == CELL_OK);
++    assert(vm_read32(0x3000) == 1 && vm_read32(0x3004) == SCE_NP_TROPHY_GRADE_BRONZE);
++    assert(!strcmp((char*)vm_base + 0x3008, "First"));
++    assert(!strcmp((char*)vm_base + 0x3008 + SCE_NP_TROPHY_NAME_MAX_SIZE, "Start."));
++    assert(vm_read8(0x3008 + SCE_NP_TROPHY_NAME_MAX_SIZE + SCE_NP_TROPHY_DESC_MAX_SIZE) == 0);
++    assert(vm_read64(0x3800) == 0 && vm_read32(0x3808) == 1 && vm_read8(0x380C) == 0);
++
++    assert(sceNpTrophyUnlockTrophy(1, 1, 0, (void*)0x4000) == SCE_NP_TROPHY_ERROR_CANNOT_UNLOCK_PLATINUM);
++    assert(sceNpTrophyUnlockTrophy(1, 1, 1, (void*)0x4000) == CELL_OK);
++    assert(vm_read32(0x4000) == 0xFFFFFFFFu);
++    assert(sceNpTrophyUnlockTrophy(1, 1, 1, (void*)0x4000) == SCE_NP_TROPHY_ERROR_ALREADY_UNLOCKED);
++    assert(sceNpTrophyUnlockTrophy(1, 1, 2, (void*)0x4000) == CELL_OK);
++    assert(vm_read32(0x4000) == 0);
++    assert(sceNpTrophyGetTrophyUnlockState(1, 1, (void*)0x5000, (void*)0x5010) == CELL_OK);
++    assert(vm_read32(0x5010) == 3 && vm_read32(0x5000) == 7);
++    assert(sceNpTrophyGetGameProgress(1, 1, (void*)0x5020) == CELL_OK && vm_read32(0x5020) == 100);
++    assert(sceNpTrophyGetTrophyInfo(1, 1, 2, NULL, (void*)0x3800) == CELL_OK);
++    assert(vm_read64(0x3800) > 62135596800000000ull && vm_read8(0x380C) == 1);
++
++    assert(sceNpTrophyTerm() == CELL_OK);
++    assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
++    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x180, 0) == CELL_OK);
+     assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+-    assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == SCE_NP_TROPHY_ERROR_UNKNOWN);
+-    g_ps3_guest_caller = callback;
+     assert(sceNpTrophyRegisterContext(1, 1, 0x300, 0xCAFE, 0) == CELL_OK);
+-    assert(calls == 1 && s_contexts[1].registered);
+-    cellSysutilCheckCallback(); assert(calls == 2);
+-    cellSysutilCheckCallback(); assert(calls == 2);
++    assert(sync_status == SCE_NP_TROPHY_STATUS_INSTALLED);
++    assert(sceNpTrophyGetGameInfo(1, 1, NULL, (void*)0x2000) == CELL_OK);
++    assert(vm_read32(0x2000) == 3 && vm_read32(0x2004) == 1 && vm_read32(0x2008) == 1 && vm_read32(0x2010) == 1);
+     assert(sceNpTrophyTerm() == CELL_OK);
+-    char file[256]; snprintf(file, sizeof(file), "%s/NPWR00000.json", root);
+-    assert(unlink(file) == 0); assert(rmdir(root) == 0); free(vm_base);
+-    puts("Trophy registration delivers installed and deferred completion statuses");
++
++    char file[512]; snprintf(file, sizeof(file), "%s/NPWR00000_00.json", g_fixture_root);
++    assert(unlink(file) == 0);
++    fixture_remove_pack();
++    assert(rmdir(g_fixture_root) == 0);
++    free(vm_base);
++    puts("Trophy registration, game/trophy info, unlocks and platinum follow the pack");
+ }
+diff --git a/libs/network/tests/test_trophy_start.c b/libs/network/tests/test_trophy_start.c
+index 3dcd91d5..0fd2bb0a 100644
+--- a/libs/network/tests/test_trophy_start.c
++++ b/libs/network/tests/test_trophy_start.c
+@@ -2,7 +2,9 @@
+  *   -Wl,-dead_strip -o /tmp/test_trophy_start && /tmp/test_trophy_start
+  */
+ #include "../sceNpTrophy.c"
++#include "../trophy_files.c"
+ #include <assert.h>
++#include <unistd.h>
+ uint8_t* vm_base;
+ uint32_t ppu_vm_size;
+ int g_resv_store_active;
+@@ -13,33 +15,63 @@ int spu_coh_is_reserved(uint32_t a) { (void)a; return 0; }
+ void spu_coh_notify_write(uint32_t a) { (void)a; }
+ void spu_lockline_lock(void) {}
+ void spu_lockline_unlock(void) {}
++ps3_guest_caller_fn g_ps3_guest_caller;
++s32 ps3_sysutil_language(void) { return 1; }
++s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]) { (void)opd; (void)args; return CELL_OK; }
++int ppu_guest_call_ct_checked(uint32_t code, uint32_t toc, uint64_t a0, uint64_t a1, uint64_t a2,
++                              uint64_t a3, uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7,
++                              uint64_t* result)
++{
++    (void)code; (void)toc; (void)a0; (void)a1; (void)a2; (void)a3; (void)a4; (void)a5; (void)a6; (void)a7;
++    *result = 0;
++    return 1;
++}
++#include "trophy_fixture.h"
+ int main(void)
+ {
++    snprintf(g_fixture_root, sizeof g_fixture_root, "/tmp/ps3recomp-trophy-start-XXXXXX");
++    assert(mkdtemp(g_fixture_root));
++    const uint64_t space = fixture_write_pack();
+     vm_base = calloc(1, 65536);
+     assert(vm_base);
+     memcpy(vm_base + 0x100, "NPWR00000", 9);
++    fixture_guest_sign(0x180);
+     assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) ==
++           SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
++    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x180, 0) ==
+            SCE_NP_TROPHY_ERROR_NOT_INITIALIZED);
+     assert(sceNpTrophyInit(NULL, 0, 0, 0) == CELL_OK);
+-    assert(sceNpTrophyCreateContext(NULL, (void*)0x100, NULL, 0) ==
++    assert(sceNpTrophyCreateContext(NULL, (void*)0x100, (void*)0x180, 0) ==
+            SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
++    vm_base[0x180] ^= 1;
++    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x180, 0) ==
++           SCE_NP_TROPHY_ERROR_INVALID_NP_COMM_ID);
++    vm_base[0x180] ^= 1;
+     for (int i = 0; i < SCE_NP_TROPHY_MAX_CONTEXTS; i++) {
+-        assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == CELL_OK);
++        assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x180, 0) == CELL_OK);
+         assert(vm_read32(0x200) == (u32)(i + 1));
+         assert(sceNpTrophyCreateHandle((void*)0x204) == CELL_OK);
+         assert(vm_read32(0x204) == (u32)(i + 1));
+     }
+-    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, NULL, 0) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
+-    assert(sceNpTrophyCreateHandle((void*)0x204) == SCE_NP_TROPHY_ERROR_OUT_OF_MEMORY);
+-    assert(sceNpTrophyDestroyContext(0) == SCE_NP_TROPHY_ERROR_INVALID_CONTEXT);
+-    assert(sceNpTrophyDestroyHandle(0) == SCE_NP_TROPHY_ERROR_INVALID_HANDLE);
++    assert(!strcmp(s_contexts[1].name, "NPWR00000_00"));
++    assert(sceNpTrophyCreateContext((void*)0x200, (void*)0x100, (void*)0x180, 0) == SCE_NP_TROPHY_ERROR_EXCEEDS_MAX);
++    assert(sceNpTrophyCreateHandle((void*)0x204) == SCE_NP_TROPHY_ERROR_EXCEEDS_MAX);
++    assert(sceNpTrophyDestroyContext(0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
++    assert(sceNpTrophyDestroyHandle(0) == SCE_NP_TROPHY_ERROR_INVALID_ARGUMENT);
+     assert(sceNpTrophyInit(NULL, 0, 0, 0) == SCE_NP_TROPHY_ERROR_ALREADY_INITIALIZED);
++    strcpy((char*)vm_base + 0x400, g_fixture_root);
++    sceNpTrophySetStoragePath((void*)0x400);
+     assert(sceNpTrophyGetRequiredDiskSpace(1, 1, (void*)0x208, 0) == CELL_OK);
+-    assert(vm_read64(0x208) == 1024 * 1024);
++    assert(vm_read64(0x208) == space);
++    assert(sceNpTrophyGetGameInfo(1, 1, (void*)0x1000, NULL) == SCE_NP_TROPHY_ERROR_CONTEXT_NOT_REGISTERED);
+     assert(sceNpTrophyDestroyContext(SCE_NP_TROPHY_MAX_CONTEXTS) == CELL_OK);
++    assert(sceNpTrophyDestroyContext(SCE_NP_TROPHY_MAX_CONTEXTS) == SCE_NP_TROPHY_ERROR_UNKNOWN_CONTEXT);
+     assert(sceNpTrophyDestroyHandle(SCE_NP_TROPHY_MAX_HANDLES) == CELL_OK);
++    assert(sceNpTrophyDestroyHandle(SCE_NP_TROPHY_MAX_HANDLES) == SCE_NP_TROPHY_ERROR_UNKNOWN_HANDLE);
+     assert(s_contexts[1].in_use && s_handles[1].in_use);
+     assert(sceNpTrophyTerm() == CELL_OK);
++    fixture_remove_pack();
++    assert(rmdir(g_fixture_root) == 0);
+     free(vm_base);
+-    puts("Trophy initialization and guest-endian checks passed");
++    puts("Trophy initialization, validation and required-space checks passed");
+ }
+diff --git a/libs/network/tests/trophy_fixture.h b/libs/network/tests/trophy_fixture.h
+new file mode 100644
+index 00000000..446822a1
+--- /dev/null
++++ b/libs/network/tests/trophy_fixture.h
+@@ -0,0 +1,99 @@
++#ifndef TROPHY_FIXTURE_H
++#define TROPHY_FIXTURE_H
++
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++static char g_fixture_root[256];
++
++static const char k_fixture_conf[] =
++    "<!--Sce-Np-Trophy-Signature: 00-->\n"
++    "<trophyconf version=\"1.1\">\n"
++    " <npcommid>NPWR00000_00</npcommid>\n"
++    " <trophy id=\"000\" hidden=\"yes\" ttype=\"P\" pid=\"-1\"/>\n"
++    " <trophy id=\"001\" hidden=\"no\" ttype=\"B\" pid=\"000\"/>\n"
++    " <trophy id=\"002\" hidden=\"yes\" ttype=\"G\" pid=\"000\"/>\n"
++    "</trophyconf>\n";
++
++static const char k_fixture_text[] =
++    "<!--Sce-Np-Trophy-Signature: 00-->\n"
++    "<trophyconf version=\"1.1\">\n"
++    " <npcommid>NPWR00000_00</npcommid>\n"
++    " <title-name>Fixture &amp; Co</title-name>\n"
++    " <title-detail>Trophies for the fixture.</title-detail>\n"
++    " <trophy id=\"000\" hidden=\"yes\" ttype=\"P\" pid=\"-1\"><name>All</name><detail>Get them all.</detail></trophy>\n"
++    " <trophy id=\"001\" hidden=\"no\" ttype=\"B\" pid=\"000\"><name>First</name><detail>Start.</detail></trophy>\n"
++    " <trophy id=\"002\" hidden=\"yes\" ttype=\"G\" pid=\"000\"><name>Last</name><detail>Finish.</detail></trophy>\n"
++    "</trophyconf>\n";
++
++static void fx_be32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
++static void fx_be64(uint8_t* p, uint64_t v) { fx_be32(p, (uint32_t)(v >> 32)); fx_be32(p + 4, (uint32_t)v); }
++
++static uint64_t fixture_write_pack(void)
++{
++    const char* names[2] = { "TROPCONF.SFM", "TROP.SFM" };
++    const char* bodies[2] = { k_fixture_conf, k_fixture_text };
++    const uint32_t count = 2, esz = 0x40;
++    uint64_t off = 0x40 + count * esz;
++    uint64_t total = off;
++    for (int i = 0; i < 2; i++) total += strlen(bodies[i]);
++    uint8_t* b = (uint8_t*)calloc(1, (size_t)total);
++    fx_be32(b, 0xDCA24D00u);
++    fx_be32(b + 4, 1);
++    fx_be64(b + 8, total);
++    fx_be32(b + 16, count);
++    fx_be32(b + 20, esz);
++    for (uint32_t i = 0; i < count; i++) {
++        uint8_t* e = b + 0x40 + i * esz;
++        memcpy(e, names[i], strlen(names[i]));
++        fx_be64(e + 32, off);
++        fx_be64(e + 40, strlen(bodies[i]));
++        memcpy(b + off, bodies[i], strlen(bodies[i]));
++        off += strlen(bodies[i]);
++    }
++    char path[512];
++    const char* parts[] = { "/PS3_GAME", "/PS3_GAME/TROPDIR", "/PS3_GAME/TROPDIR/NPWR00000_00" };
++    for (int i = 0; i < 3; i++) {
++        snprintf(path, sizeof path, "%s%s", g_fixture_root, parts[i]);
++        mkdir(path, 0755);
++    }
++    snprintf(path, sizeof path, "%s/PS3_GAME/TROPDIR/NPWR00000_00/TROPHY.TRP", g_fixture_root);
++    FILE* f = fopen(path, "wb");
++    fwrite(b, 1, (size_t)total, f);
++    fclose(f);
++    free(b);
++    return total - 0x40 - (uint64_t)count * esz;
++}
++
++static void fixture_remove_pack(void)
++{
++    char path[512];
++    snprintf(path, sizeof path, "%s/PS3_GAME/TROPDIR/NPWR00000_00/TROPHY.TRP", g_fixture_root);
++    remove(path);
++    const char* parts[] = { "/PS3_GAME/TROPDIR/NPWR00000_00", "/PS3_GAME/TROPDIR", "/PS3_GAME" };
++    for (int i = 0; i < 3; i++) {
++        snprintf(path, sizeof path, "%s%s", g_fixture_root, parts[i]);
++        rmdir(path);
++    }
++}
++
++const char* cellGame_get_boot_path(void) { return NULL; }
++int cellfs_translate_path(const char* ps3_path, char* host_buf, size_t buf_size)
++{
++    if (strncmp(ps3_path, "/dev_bdvd/", 10)) return -1;
++    snprintf(host_buf, buf_size, "%s/%s", g_fixture_root, ps3_path + 10);
++    return 0;
++}
++
++static void fixture_guest_sign(uint32_t ea)
++{
++    memset(vm_base + ea, 0, 160);
++    fx_be32(vm_base + ea, 0xB9DDE13Bu);
++    vm_base[ea + 4] = 0x01;
++    vm_base[ea + 5] = 0x00;
++}
++
++#endif
+diff --git a/libs/network/trophy_files.c b/libs/network/trophy_files.c
+new file mode 100644
+index 00000000..ed963990
+--- /dev/null
++++ b/libs/network/trophy_files.c
+@@ -0,0 +1,596 @@
++/*
++ * trophy_files -- a title's PS3 trophy files on the host. See trophy_files.h
++ * for the formats. Written from the public format documentation and the
++ * readers of the trackers that use the folder (Playnite's SuccessStory and
++ * Playnite Achievements); nothing here comes from an emulator's code.
++ */
++#include "trophy_files.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++
++#ifdef _WIN32
++#  ifndef WIN32_LEAN_AND_MEAN
++#    define WIN32_LEAN_AND_MEAN
++#  endif
++#  include <windows.h>
++#  include <direct.h>
++#  define TF_MKDIR(p)  _mkdir(p)
++#  define TF_STAT      _stat64
++#  define TF_STAT_T    struct __stat64
++#  define TF_IFMT      _S_IFMT
++#  define TF_IFDIR     _S_IFDIR
++#  define TF_IFREG     _S_IFREG
++#else
++#  include <unistd.h>
++#  include <dirent.h>
++#  include <sys/types.h>
++#  define TF_MKDIR(p)  mkdir(p, 0755)
++#  define TF_STAT      stat
++#  define TF_STAT_T    struct stat
++#  define TF_IFMT      S_IFMT
++#  define TF_IFDIR     S_IFDIR
++#  define TF_IFREG     S_IFREG
++#endif
++
++/* ---- big-endian helpers ---- */
++
++static uint32_t rd32(const uint8_t* p) { return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]; }
++static uint64_t rd64(const uint8_t* p) { return (uint64_t)rd32(p) << 32 | rd32(p + 4); }
++static void wr32(uint8_t* p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
++static void wr64(uint8_t* p, uint64_t v) { wr32(p, (uint32_t)(v >> 32)); wr32(p + 4, (uint32_t)v); }
++
++/* ---- TROPHY.TRP ---- */
++
++#define TRP_MAGIC 0xDCA24D00u
++
++int trp_open(const char* path, trp_index* out)
++{
++    memset(out, 0, sizeof *out);
++    FILE* f = fopen(path, "rb");
++    if (!f) return 0;
++    uint8_t h[0x40];
++    int ok = fread(h, 1, sizeof h, f) == sizeof h && rd32(h) == TRP_MAGIC;
++    const uint64_t fsize = ok ? rd64(h + 8) : 0;
++    const uint32_t count = ok ? rd32(h + 16) : 0, esz = ok ? rd32(h + 20) : 0;
++    if (ok && (esz < 48 || count > TROPHY_TRP_MAX_FILES)) ok = 0;
++    for (uint32_t i = 0; ok && i < count; i++) {
++        uint8_t e[48];
++        if (fseek(f, (long)(0x40 + (uint64_t)i * esz), SEEK_SET) || fread(e, 1, 48, f) != 48) { ok = 0; break; }
++        trp_entry* d = &out->e[out->n];
++        memcpy(d->name, e, 32);
++        d->name[32] = 0;
++        d->offset = rd64(e + 32);
++        d->size = rd64(e + 40);
++        if (!d->name[0] || d->offset + d->size > fsize || d->size > (64u << 20)) continue;   /* skip a bad one */
++        out->n++;
++    }
++    fclose(f);
++    if (!ok) { out->n = 0; return 0; }
++    snprintf(out->path, sizeof out->path, "%s", path);
++    out->file_size = fsize;
++    out->entry_count = count;
++    out->entry_size = esz;
++    return 1;
++}
++
++const trp_entry* trp_find_entry(const trp_index* t, const char* name)
++{
++    for (int i = 0; i < t->n; i++)
++        if (!strcmp(t->e[i].name, name)) return &t->e[i];
++    return NULL;
++}
++
++char* trp_read_entry_data(const trp_index* t, const char* name, size_t* size)
++{
++    const trp_entry* e = trp_find_entry(t, name);
++    if (!e) return NULL;
++    FILE* f = fopen(t->path, "rb");
++    if (!f) return NULL;
++    char* d = (char*)malloc((size_t)e->size + 1);
++    if (d && (fseek(f, (long)e->offset, SEEK_SET) || fread(d, 1, (size_t)e->size, f) != (size_t)e->size)) { free(d); d = NULL; }
++    fclose(f);
++    if (!d) return NULL;
++    d[e->size] = 0;
++    if (size) *size = (size_t)e->size;
++    return d;
++}
++
++/* ---- TROP*.SFM ---- */
++
++static void utf8_put(char** o, char* end, unsigned c)
++{
++    char b[4];
++    int n;
++    if (c < 0x80) { b[0] = (char)c; n = 1; }
++    else if (c < 0x800) { b[0] = (char)(0xC0 | c >> 6); b[1] = (char)(0x80 | (c & 0x3F)); n = 2; }
++    else if (c < 0x10000) { b[0] = (char)(0xE0 | c >> 12); b[1] = (char)(0x80 | (c >> 6 & 0x3F)); b[2] = (char)(0x80 | (c & 0x3F)); n = 3; }
++    else { b[0] = (char)(0xF0 | c >> 18); b[1] = (char)(0x80 | (c >> 12 & 0x3F)); b[2] = (char)(0x80 | (c >> 6 & 0x3F)); b[3] = (char)(0x80 | (c & 0x3F)); n = 4; }
++    if (*o + n >= end) return;
++    memcpy(*o, b, (size_t)n);
++    *o += n;
++}
++
++/* Text between a and b, entities decoded, whitespace trimmed. */
++static void xml_text(const char* a, const char* b, char* out, size_t cap)
++{
++    char* o = out;
++    char* end = out + cap;
++    while (a < b && (*a == ' ' || *a == '\n' || *a == '\r' || *a == '\t')) a++;
++    while (b > a && (b[-1] == ' ' || b[-1] == '\n' || b[-1] == '\r' || b[-1] == '\t')) b--;
++    while (a < b && o + 1 < end) {
++        if (*a == '&') {
++            const char* semi = memchr(a, ';', (size_t)(b - a));
++            if (semi && semi - a <= 10) {
++                const size_t k = (size_t)(semi - a - 1);
++                unsigned c = 0;
++                if (k == 3 && !strncmp(a + 1, "amp", 3)) c = '&';
++                else if (k == 2 && !strncmp(a + 1, "lt", 2)) c = '<';
++                else if (k == 2 && !strncmp(a + 1, "gt", 2)) c = '>';
++                else if (k == 4 && !strncmp(a + 1, "quot", 4)) c = '"';
++                else if (k == 4 && !strncmp(a + 1, "apos", 4)) c = '\'';
++                else if (k >= 2 && a[1] == '#') c = (unsigned)strtoul(a + (a[2] == 'x' || a[2] == 'X' ? 3 : 2), NULL, a[2] == 'x' || a[2] == 'X' ? 16 : 10);
++                if (c) { utf8_put(&o, end, c); a = semi + 1; continue; }
++            }
++        }
++        *o++ = *a++;
++    }
++    *o = 0;
++}
++
++/* <tag>text</tag> inside [p, end): 1 when found. */
++static int xml_elem(const char* p, const char* end, const char* tag, char* out, size_t cap)
++{
++    char open[40], close[40];
++    snprintf(open, sizeof open, "<%s>", tag);
++    snprintf(close, sizeof close, "</%s>", tag);
++    const size_t ol = strlen(open);
++    for (const char* s = p; s + ol <= end; s++) {
++        if (memcmp(s, open, ol)) continue;
++        const char* a = s + ol;
++        for (const char* e = a; e + strlen(close) <= end; e++)
++            if (!memcmp(e, close, strlen(close))) { xml_text(a, e, out, cap); return 1; }
++        return 0;
++    }
++    return 0;
++}
++
++/* attr="value" inside the tag [p, end). */
++static int xml_attr(const char* p, const char* end, const char* name, char* out, size_t cap)
++{
++    const size_t nl = strlen(name);
++    for (const char* s = p; s + nl + 2 <= end; s++) {
++        if (memcmp(s, name, nl) || s[nl] != '=' || (s[nl + 1] != '"' && s[nl + 1] != '\'')) continue;
++        if (s > p && s[-1] != ' ' && s[-1] != '\t' && s[-1] != '\n' && s[-1] != '\r') continue;
++        const char q = s[nl + 1];
++        const char* a = s + nl + 2;
++        const char* e = memchr(a, q, (size_t)(end - a));
++        if (!e) return 0;
++        xml_text(a, e, out, cap);
++        return 1;
++    }
++    return 0;
++}
++
++static trophy_def* set_get(trophy_set* s, int id)
++{
++    for (int i = 0; i < s->n; i++)
++        if (s->t[i].id == id) return &s->t[i];
++    if (s->n >= TROPHY_FILES_MAX) return NULL;
++    trophy_def* d = &s->t[s->n++];
++    memset(d, 0, sizeof *d);
++    d->id = id;
++    d->grade = 'B';
++    d->pid = -1;
++    return d;
++}
++
++int trophy_sfm_parse(const char* xml, trophy_set* into)
++{
++    if (!xml) return into->n;
++    const char* end = xml + strlen(xml);
++    char buf[256];
++    const char* conf = strstr(xml, "<trophyconf");
++    if (!conf) return into->n;
++    const char* first = strstr(conf, "<trophy ");
++    const char* head_end = first ? first : end;
++    if (xml_elem(conf, head_end, "npcommid", buf, sizeof buf) && buf[0])
++        snprintf(into->comm_id, sizeof into->comm_id, "%s", buf);
++    if (xml_elem(conf, head_end, "title-name", buf, sizeof buf) && buf[0])
++        snprintf(into->title, sizeof into->title, "%s", buf);
++    {
++        char detail[sizeof into->title_detail];
++        if (xml_elem(conf, head_end, "title-detail", detail, sizeof detail) && detail[0])
++            snprintf(into->title_detail, sizeof into->title_detail, "%s", detail);
++    }
++    for (const char* p = first; p; p = strstr(p + 1, "<trophy ")) {
++        const char* gt = strchr(p, '>');
++        if (!gt) break;
++        if (!xml_attr(p, gt, "id", buf, sizeof buf)) continue;
++        trophy_def* d = set_get(into, atoi(buf));
++        if (!d) break;
++        if (xml_attr(p, gt, "ttype", buf, sizeof buf) && buf[0]) d->grade = buf[0];
++        if (xml_attr(p, gt, "pid", buf, sizeof buf) && buf[0]) d->pid = atoi(buf);
++        if (xml_attr(p, gt, "hidden", buf, sizeof buf)) d->hidden = !strcmp(buf, "yes");
++        if (gt[-1] == '/') continue;                           /* <trophy .../>: attributes only */
++        const char* close = strstr(gt, "</trophy>");
++        if (!close) close = end;
++        xml_elem(gt, close, "name", d->name, sizeof d->name);
++        xml_elem(gt, close, "detail", d->detail, sizeof d->detail);
++    }
++    return into->n;
++}
++
++int trophy_set_load(trophy_set* s, const trp_index* t, const char* lang_file)
++{
++    memset(s, 0, sizeof *s);
++    char* conf = trp_read_entry_data(t, "TROPCONF.SFM", NULL);
++    trophy_sfm_parse(conf, s);
++    free(conf);
++    char* text = lang_file ? trp_read_entry_data(t, lang_file, NULL) : NULL;
++    if (!text) text = trp_read_entry_data(t, "TROP.SFM", NULL);
++    trophy_sfm_parse(text, s);
++    free(text);
++    return s->n;
++}
++
++const trophy_def* trophy_set_find(const trophy_set* s, int id)
++{
++    for (int i = 0; i < s->n; i++)
++        if (s->t[i].id == id) return &s->t[i];
++    return NULL;
++}
++
++void trophy_lang_file(int ps3_lang, char* out, size_t n)
++{
++    snprintf(out, n, "TROP_%02d.SFM", ps3_lang);
++}
++
++/* ---- TROPUSR.DAT ---- */
++
++#define TROPUSR_MAGIC   0x818F54ADu
++#define TROPUSR_HEAD    0x30
++#define TROPUSR_TABLE   0x20
++#define TROPUSR_ENTRY   0x10       /* each entry's own header */
++#define TROPUSR_SIZE4   0x50       /* type 4 contents */
++#define TROPUSR_SIZE6   0x60       /* type 6 contents */
++/* CellRtc ticks (us since 0001-01-01) at the Unix epoch */
++#define TROPHY_TICK_UNIX_EPOCH 62135596800000000ull
++
++uint64_t trophy_tick_from_unix(uint64_t s) { return s ? s * 1000000ull + TROPHY_TICK_UNIX_EPOCH : 0; }
++uint64_t trophy_unix_from_tick(uint64_t t) { return t > TROPHY_TICK_UNIX_EPOCH ? (t - TROPHY_TICK_UNIX_EPOCH) / 1000000ull : 0; }
++
++size_t tropusr_size(int n)
++{
++    return TROPUSR_HEAD + 2 * TROPUSR_TABLE + (size_t)n * (TROPUSR_ENTRY + TROPUSR_SIZE4)
++                                            + (size_t)n * (TROPUSR_ENTRY + TROPUSR_SIZE6);
++}
++
++static uint32_t grade_num(char g)
++{
++    switch (g) {
++    case 'P': return 1;
++    case 'G': return 2;
++    case 'S': return 3;
++    default:  return 4;
++    }
++}
++
++size_t tropusr_build(const trophy_set* s, const uint8_t* unlocked, const uint64_t* unix_secs,
++                     uint8_t* out, size_t cap)
++{
++    const int n = s->n;
++    const size_t need = tropusr_size(n);
++    if (!out || cap < need || n <= 0) return 0;
++    memset(out, 0, need);
++    wr32(out + 0x00, TROPUSR_MAGIC);
++    wr32(out + 0x04, 0x00010000u);
++    wr32(out + 0x08, 2);
++    const size_t off4 = TROPUSR_HEAD + 2 * TROPUSR_TABLE;
++    const size_t off6 = off4 + (size_t)n * (TROPUSR_ENTRY + TROPUSR_SIZE4);
++    uint8_t* th = out + TROPUSR_HEAD;
++    wr32(th + 0, 4); wr32(th + 4, TROPUSR_SIZE4); wr32(th + 8, 1); wr32(th + 12, (uint32_t)n); wr64(th + 16, off4);
++    th += TROPUSR_TABLE;
++    wr32(th + 0, 6); wr32(th + 4, TROPUSR_SIZE6); wr32(th + 8, 1); wr32(th + 12, (uint32_t)n); wr64(th + 16, off6);
++    for (int i = 0; i < n; i++) {
++        const trophy_def* d = &s->t[i];
++        const int id = d->id;
++        const int on = id >= 0 && id < TROPHY_FILES_MAX && unlocked && unlocked[id];
++        const uint64_t tick = on && unix_secs ? trophy_tick_from_unix(unix_secs[id]) : 0;
++        uint8_t* e4 = out + off4 + (size_t)i * (TROPUSR_ENTRY + TROPUSR_SIZE4);
++        wr32(e4 + 0, 4); wr32(e4 + 4, TROPUSR_SIZE4); wr32(e4 + 8, (uint32_t)id);
++        wr32(e4 + 16, (uint32_t)id); wr32(e4 + 20, grade_num(d->grade)); wr32(e4 + 24, (uint32_t)d->pid);
++        uint8_t* e6 = out + off6 + (size_t)i * (TROPUSR_ENTRY + TROPUSR_SIZE6);
++        wr32(e6 + 0, 6); wr32(e6 + 4, TROPUSR_SIZE6); wr32(e6 + 8, (uint32_t)id);
++        wr32(e6 + 16, (uint32_t)id); wr32(e6 + 20, on ? 1u : 0u);
++        wr64(e6 + 32, tick); wr64(e6 + 40, tick);
++    }
++    return need;
++}
++
++int tropusr_parse(const uint8_t* b, size_t len, tropusr_state* out, int max)
++{
++    if (!b || len < TROPUSR_HEAD || rd32(b) != TROPUSR_MAGIC) return -1;
++    const uint32_t tables = rd32(b + 8);
++    if (!tables || tables > (len - TROPUSR_HEAD) / TROPUSR_TABLE) return -1;
++    int found = 0, n = 0;
++    for (uint32_t t = 0; t < tables; t++) {
++        const uint8_t* th = b + TROPUSR_HEAD + (size_t)t * TROPUSR_TABLE;
++        const uint32_t type = rd32(th), esz = rd32(th + 4), count = rd32(th + 12);
++        const uint64_t off = rd64(th + 16);
++        const uint64_t stride = (uint64_t)esz + TROPUSR_ENTRY;
++        if (off > len || (count && (stride > len || count > (len - off) / stride))) return -1;
++        if (type != 6) continue;
++        if (found || esz != TROPUSR_SIZE6) return -1;
++        found = 1;
++        for (uint32_t i = 0; i < count; i++) {
++            const uint8_t* e = b + off + (size_t)i * stride;
++            if (rd32(e) != 6 || rd32(e + 4) != TROPUSR_SIZE6) return -1;
++            const uint32_t id = rd32(e + 16);
++            for (int k = 0; k < n && k < max; k++)
++                if (out[k].id == id) return -1;                     /* a duplicate id */
++            if (n < max) {
++                out[n].id = id;
++                out[n].state = rd32(e + 20);
++                out[n].time1 = rd64(e + 32);
++                out[n].time2 = rd64(e + 40);
++                out[n].offset = (size_t)(off + (size_t)i * stride);
++            }
++            n++;
++        }
++    }
++    return found ? n : -1;
++}
++
++int tropusr_merge(uint8_t* b, size_t len, const uint8_t* unlocked, const uint64_t* unix_secs)
++{
++    tropusr_state st[TROPHY_FILES_MAX * 2];
++    const int n = tropusr_parse(b, len, st, (int)(sizeof st / sizeof st[0]));
++    if (n < 0 || n > (int)(sizeof st / sizeof st[0])) return -1;
++    int changed = 0;
++    for (int i = 0; i < n; i++) {
++        const uint32_t id = st[i].id;
++        if (id >= TROPHY_FILES_MAX || !unlocked || !unlocked[id]) continue;
++        const uint64_t ours = unix_secs ? trophy_tick_from_unix(unix_secs[id]) : 0;
++        uint8_t* e = b + st[i].offset;
++        if (!st[i].state) {
++            wr32(e + 20, 1);
++            wr64(e + 32, ours);
++            wr64(e + 40, ours);
++            changed++;
++        } else if (ours && (!st[i].time2 || ours < st[i].time2)) {
++            wr64(e + 32, ours);
++            wr64(e + 40, ours);
++            changed++;
++        }
++    }
++    return changed;
++}
++
++/* ---- the folder ---- */
++
++static int is_dir(const char* p)
++{
++    TF_STAT_T st;
++    return TF_STAT(p, &st) == 0 && (st.st_mode & TF_IFMT) == TF_IFDIR;
++}
++
++static long long file_size(const char* p)
++{
++    TF_STAT_T st;
++    if (TF_STAT(p, &st) != 0 || (st.st_mode & TF_IFMT) != TF_IFREG) return -1;
++    return (long long)st.st_size;
++}
++
++int trophy_mkdirs(const char* path)
++{
++    char tmp[1024];
++    snprintf(tmp, sizeof tmp, "%s", path);
++    for (char* p = tmp + 1; *p; p++) {
++        if (*p != '/' && *p != '\\') continue;
++        if (p[-1] == ':') continue;                       /* C:\ */
++        const char c = *p;
++        *p = 0;
++        if (!is_dir(tmp)) TF_MKDIR(tmp);
++        *p = c;
++    }
++    if (!is_dir(tmp)) TF_MKDIR(tmp);
++    return is_dir(tmp) ? 0 : -1;
++}
++
++uint8_t* trophy_read_file(const char* path, size_t* n)
++{
++    FILE* f = fopen(path, "rb");
++    if (!f) return NULL;
++    uint8_t* d = NULL;
++    if (fseek(f, 0, SEEK_END) == 0) {
++        const long sz = ftell(f);
++        if (sz >= 0 && sz < (64l << 20) && fseek(f, 0, SEEK_SET) == 0) {
++            d = (uint8_t*)malloc((size_t)sz + 1);
++            if (d && fread(d, 1, (size_t)sz, f) != (size_t)sz) { free(d); d = NULL; }
++            if (d) { d[sz] = 0; if (n) *n = (size_t)sz; }
++        }
++    }
++    fclose(f);
++    return d;
++}
++
++int trophy_write_atomic(const char* path, const void* data, size_t n)
++{
++    char tmp[1100];
++    snprintf(tmp, sizeof tmp, "%s.tmp", path);
++    FILE* f = fopen(tmp, "wb");
++    int ok = f && fwrite(data, 1, n, f) == n;
++    if (f && fclose(f) != 0) ok = 0;
++#ifdef _WIN32
++    ok = ok && MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
++#else
++    ok = ok && rename(tmp, path) == 0;
++#endif
++    if (!ok) remove(tmp);
++    return ok ? 0 : -1;
++}
++
++int trophy_folder_install(const char* dir, const trp_index* t, const char* lang_file)
++{
++    if (trophy_mkdirs(dir) != 0) return -1;
++    char path[1200];
++    int written = 0, errors = 0;
++    /* TROPCONF.SFM: one file with the structure and the text, in the chosen language */
++    const char* conf_src = lang_file && trp_find_entry(t, lang_file) ? lang_file
++                         : trp_find_entry(t, "TROP.SFM") ? "TROP.SFM" : "TROPCONF.SFM";
++    size_t csz = 0;
++    char* conf = trp_read_entry_data(t, conf_src, &csz);
++    if (conf) {
++        snprintf(path, sizeof path, "%s/TROPCONF.SFM", dir);
++        size_t have_n = 0;
++        uint8_t* have = trophy_read_file(path, &have_n);
++        if (!have || have_n != csz || memcmp(have, conf, csz)) {
++            if (trophy_write_atomic(path, conf, csz) == 0) written++; else errors++;
++        }
++        free(have);
++        free(conf);
++    } else errors++;
++    for (int i = 0; i < t->n; i++) {
++        const trp_entry* e = &t->e[i];
++        if (!strcmp(e->name, "TROPCONF.SFM") || strchr(e->name, '/') || strchr(e->name, '\\') || strstr(e->name, ".."))
++            continue;
++        snprintf(path, sizeof path, "%s/%s", dir, e->name);
++        if (file_size(path) == (long long)e->size) continue;
++        size_t sz = 0;
++        char* d = trp_read_entry_data(t, e->name, &sz);
++        if (d && trophy_write_atomic(path, d, sz) == 0) written++; else errors++;
++        free(d);
++    }
++    return errors ? -1 : written;
++}
++
++int trophy_folder_write_usr(const char* dir, const trophy_set* s, const uint8_t* unlocked,
++                            const uint64_t* unix_secs, int merge)
++{
++    char path[1200];
++    snprintf(path, sizeof path, "%s/TROPUSR.DAT", dir);
++    size_t have_n = 0;
++    uint8_t* have = trophy_read_file(path, &have_n);
++    if (merge && have) {
++        const int changed = tropusr_merge(have, have_n, unlocked, unix_secs);
++        int r = changed < 0 ? -1 : 0;
++        if (changed > 0) {
++            char bak[1300];
++            snprintf(bak, sizeof bak, "%s.port-backup", path);
++            if (file_size(bak) < 0) {
++                size_t on = 0;
++                uint8_t* orig = trophy_read_file(path, &on);
++                if (orig) trophy_write_atomic(bak, orig, on);
++                free(orig);
++            }
++            r = trophy_write_atomic(path, have, have_n) == 0 ? 1 : -1;
++        }
++        free(have);
++        return r;
++    }
++    const size_t need = tropusr_size(s->n);
++    uint8_t* b = (uint8_t*)malloc(need);
++    int r = -1;
++    if (b && tropusr_build(s, unlocked, unix_secs, b, need) == need) {
++        if (have && have_n == need && !memcmp(have, b, need)) r = 0;
++        else r = trophy_write_atomic(path, b, need) == 0 ? 1 : -1;
++    }
++    free(b);
++    free(have);
++    return r;
++}
++
++int trophy_rpcs3_home(const char* given, char* out, size_t n)
++{
++    if (!given || !*given) return 0;
++    char base[1024], p[1200];
++    snprintf(base, sizeof base, "%s", given);
++    size_t l = strlen(base);
++    while (l > 1 && (base[l - 1] == '/' || base[l - 1] == '\\')) base[--l] = 0;
++    /* <home>/<user>/trophy given: its parent */
++    if (l > 7 && (base[l - 7] == '/' || base[l - 7] == '\\') && !strcmp(base + l - 6, "trophy")) {
++        base[l - 7] = 0;
++        if (is_dir(base)) { snprintf(out, n, "%s", base); return 1; }
++        return 0;
++    }
++    snprintf(p, sizeof p, "%s/trophy", base);
++    if (is_dir(p)) { snprintf(out, n, "%s", base); return 1; }    /* home/<user> */
++    if (strlen(base) >= 8 && strspn(base + strlen(base) - 8, "0123456789") == 8 && is_dir(base)) {
++        snprintf(out, n, "%s", base);                                 /* a home/<user> with no trophies yet */
++        return 1;
++    }
++    /* RPCS3's folder (or its portable/ one): its active user, else 00000001 */
++    static const char* const roots[] = { "", "/portable" };
++    for (size_t i = 0; i < sizeof roots / sizeof roots[0]; i++) {
++        char user[16] = "00000001", line[256];
++        snprintf(p, sizeof p, "%s%s/GuiConfigs/persistent_settings.dat", base, roots[i]);
++        FILE* f = fopen(p, "r");
++        if (f) {
++            int in_users = 0;
++            while (fgets(line, sizeof line, f)) {
++                char* s = line;
++                while (*s == ' ' || *s == '\t') s++;
++                if (*s == '[') { in_users = !strncmp(s, "[Users]", 7); continue; }
++                if (in_users && !strncmp(s, "active_user", 11)) {
++                    char* v = strchr(s, '=');
++                    if (v) {
++                        v++;
++                        while (*v == ' ' || *v == '\t') v++;
++                        if (strspn(v, "0123456789") == 8) { memcpy(user, v, 8); user[8] = 0; }
++                    }
++                }
++            }
++            fclose(f);
++        }
++        snprintf(p, sizeof p, "%s%s/dev_hdd0/home/%s", base, roots[i], user);
++        if (is_dir(p)) { snprintf(out, n, "%s", p); return 1; }
++    }
++    snprintf(p, sizeof p, "%s/home/00000001", base);                 /* its dev_hdd0 */
++    if (is_dir(p)) { snprintf(out, n, "%s", p); return 1; }
++    return 0;
++}
++
++/* The pack for <commId>_<nn>: PS3_GAME/TROPDIR under the disc root, else a game
++ * folder under dev_hdd0/game (a PSN title keeps TROPDIR in its own folder). */
++int trophy_find_trp(const char* disc_root, const char* hdd0_root, const char* folder, char* out, size_t n)
++{
++    if (disc_root && *disc_root) {
++        snprintf(out, n, "%s/PS3_GAME/TROPDIR/%s/TROPHY.TRP", disc_root, folder);
++        if (file_size(out) > 0) return 1;
++        snprintf(out, n, "%s/TROPDIR/%s/TROPHY.TRP", disc_root, folder);
++        if (file_size(out) > 0) return 1;
++    }
++    if (!hdd0_root || !*hdd0_root) return 0;
++#ifdef _WIN32
++    char pat[1100];
++    snprintf(pat, sizeof pat, "%s/game/*", hdd0_root);
++    WIN32_FIND_DATAA fd;
++    HANDLE h = FindFirstFileA(pat, &fd);
++    if (h == INVALID_HANDLE_VALUE) return 0;
++    int found = 0;
++    do {
++        if (fd.cFileName[0] == '.' || !(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
++        snprintf(out, n, "%s/game/%s/TROPDIR/%s/TROPHY.TRP", hdd0_root, fd.cFileName, folder);
++        found = file_size(out) > 0;
++    } while (!found && FindNextFileA(h, &fd));
++    FindClose(h);
++    return found;
++#else
++    char games[1100];
++    snprintf(games, sizeof games, "%s/game", hdd0_root);
++    DIR* d = opendir(games);
++    if (!d) return 0;
++    struct dirent* de;
++    int found = 0;
++    while (!found && (de = readdir(d))) {
++        if (de->d_name[0] == '.') continue;
++        snprintf(out, n, "%s/%s/TROPDIR/%s/TROPHY.TRP", games, de->d_name, folder);
++        found = file_size(out) > 0;
++    }
++    closedir(d);
++    return found;
++#endif
++}
+diff --git a/libs/network/trophy_files.h b/libs/network/trophy_files.h
+new file mode 100644
+index 00000000..f4de130c
+--- /dev/null
++++ b/libs/network/trophy_files.h
+@@ -0,0 +1,158 @@
++/*
++ * trophy_files -- a title's PS3 trophy files on the host (game-agnostic).
++ *
++ *   TROPHY.TRP     the trophy pack a game ships (PS3_GAME/TROPDIR/<id>_<nn>/):
++ *                  the definitions (TROPCONF.SFM), their text (TROP.SFM and
++ *                  TROP_<language>.SFM) and the icons (ICON0.PNG, TROP<nnn>.PNG)
++ *   TROPUSR.DAT    one user's unlocks with their times
++ *
++ * The same folder as RPCS3's dev_hdd0/home/<user>/trophy/<id>_<nn>/ is written
++ * from them (trophy_folder_install + trophy_folder_write_usr), so the trophy
++ * trackers that read RPCS3's folder (Playnite's SuccessStory and Playnite
++ * Achievements) can read the port's too. sceNpTrophy.c keeps its own unlock
++ * file as the source of truth; this folder is a copy, rewritten from it.
++ *
++ * The formats, as the public documentation and those trackers' readers have them:
++ *
++ * TROPHY.TRP (big-endian): a 0x40-byte header -- magic 0xDCA24D00, version,
++ * file size (u64), entry count, entry size (0x40), a dev flag, a SHA-1 (checked
++ * from version 2 on) and padding -- then the entries: name[32], offset (u64),
++ * size (u64), flags (u32), padding. A PS3 pack stores its files as they are.
++ *
++ * TROP*.SFM: XML after a signature comment. <trophyconf> holds <npcommid>,
++ * <title-name>, and per trophy <trophy id="000" hidden="no" ttype="P" pid="-1">
++ * with <name> and <detail> (TROPCONF.SFM in a pack may carry the attributes
++ * only; the text is in TROP.SFM / TROP_xx.SFM). ttype: P(latinum) G S B.
++ *
++ * TROPUSR.DAT (big-endian):
++ *   0x00 u32 magic 0x818F54AD   0x04 u32 0x00010000   0x08 u32 table count
++ *   0x0C u32 0                  0x10 0x20 bytes of zero
++ *   then one 0x20-byte header per table:
++ *     +0 u32 type  +4 u32 entry size (the contents after each entry's own
++ *     0x10-byte header)  +8 u32 1  +12 u32 entry count  +16 u64 file offset of
++ *     the entries  +24 u64 0
++ *   each entry: +0 u32 type  +4 u32 entry size  +8 u32 index  +12 u32 0, then
++ *     type 4 (size 0x50): trophy id, grade (1 platinum, 2 gold, 3 silver,
++ *       4 bronze), pid (0xFFFFFFFF = none), zeros
++ *     type 6 (size 0x60): trophy id, state (1 = unlocked), u32 0, u32 0,
++ *       time 1 (u64), time 2 (u64), zeros
++ *   The times are CellRtc ticks: microseconds since 0001-01-01 00:00 UTC.
++ *   Playnite Achievements walks the table headers to type 6 and reads +16 id,
++ *   +20 state, +40 time 2; SuccessStory scans the bytes for the entry headers
++ *   (type 4 / 0x50 and type 6 / 0x60), takes the last <trophy count> of them,
++ *   the low byte of the index as the id, +20 state and the low 7 bytes of time 1.
++ *   So: index == trophy id, both times equal, type 6 last in the file.
++ */
++#ifndef PS3RECOMP_TROPHY_FILES_H
++#define PS3RECOMP_TROPHY_FILES_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define TROPHY_FILES_MAX     128     /* SCE_NP_TROPHY_MAX_NUM_TROPHIES */
++#define TROPHY_TRP_MAX_FILES 512
++
++typedef struct trophy_def {
++    int  id;
++    char grade;          /* 'P', 'G', 'S', 'B' ('B' when the file says nothing) */
++    int  pid;            /* the platinum it counts towards; -1 = none */
++    int  hidden;
++    char name[128];      /* UTF-8, XML entities decoded */
++    char detail[1024];
++} trophy_def;
++
++typedef struct trophy_set {
++    char       comm_id[16];   /* <npcommid>, e.g. "NPWR01730_00" */
++    char       title[128];
++    char       title_detail[1024];
++    int        n;             /* trophies in t[], in file order */
++    trophy_def t[TROPHY_FILES_MAX];
++} trophy_set;
++
++typedef struct trp_entry {
++    char     name[33];
++    uint64_t offset, size;
++} trp_entry;
++
++typedef struct trp_index {
++    char      path[1024];
++    uint64_t  file_size;
++    uint32_t  entry_count, entry_size;
++    int       n;
++    trp_entry e[TROPHY_TRP_MAX_FILES];
++} trp_index;
++
++/* ---- TROPHY.TRP ---- */
++int   trp_open(const char* path, trp_index* out);                  /* 1 = a trophy pack */
++const trp_entry* trp_find_entry(const trp_index* t, const char* name);
++char* trp_read_entry_data(const trp_index* t, const char* name, size_t* size);  /* malloc'd, NUL-terminated */
++
++/* ---- TROP*.SFM ---- */
++/* Parse a trophyconf XML. With `into` already filled (structure from TROPCONF.SFM),
++ * a text file only adds names, details and the title; trophies it lists that `into`
++ * lacks are added. Returns the trophy count. */
++int trophy_sfm_parse(const char* xml, trophy_set* into);
++/* The set from a pack: TROPCONF.SFM, then the text of `lang_file` (e.g. "TROP_02.SFM"),
++ * else TROP.SFM. Returns the trophy count (0 = none). */
++int trophy_set_load(trophy_set* s, const trp_index* t, const char* lang_file);
++const trophy_def* trophy_set_find(const trophy_set* s, int id);
++/* The TROP_xx.SFM a PS3 system language id uses ("TROP_01.SFM" for 1). */
++void trophy_lang_file(int ps3_lang, char* out, size_t n);
++
++/* ---- TROPUSR.DAT ---- */
++uint64_t trophy_tick_from_unix(uint64_t unix_secs);   /* 0 stays 0 */
++uint64_t trophy_unix_from_tick(uint64_t tick);
++size_t   tropusr_size(int n);
++/* unlocked[id] / unix_secs[id] indexed by trophy id (TROPHY_FILES_MAX entries). */
++size_t   tropusr_build(const trophy_set* s, const uint8_t* unlocked, const uint64_t* unix_secs,
++                       uint8_t* out, size_t cap);
++
++typedef struct tropusr_state {
++    uint32_t id, state;
++    uint64_t time1, time2;
++    size_t   offset;          /* of the entry in the file */
++} tropusr_state;
++/* The type-6 table, checked the way the trackers check it. Returns the entry count,
++ * -1 when the file is not a valid TROPUSR.DAT. */
++int tropusr_parse(const uint8_t* b, size_t len, tropusr_state* out, int max);
++/* Merge our unlocks into an existing file, in place: a trophy unlocked here and
++ * locked there is unlocked with our time; unlocked on both sides keeps the earlier
++ * time. Nothing is ever locked. Returns the entries changed, -1 = not a valid file. */
++int tropusr_merge(uint8_t* b, size_t len, const uint8_t* unlocked, const uint64_t* unix_secs);
++
++/* ---- the folder ---- */
++int      trophy_mkdirs(const char* path);
++uint8_t* trophy_read_file(const char* path, size_t* n);          /* malloc'd */
++int      trophy_write_atomic(const char* path, const void* data, size_t n);   /* temp file + rename */
++/* Every file of the pack into `dir` (made if missing), where missing or of another
++ * size. TROPCONF.SFM becomes the text of `lang_file` (else TROP.SFM, else the pack's
++ * own TROPCONF.SFM): names and details in one file, as the trackers read it. The
++ * other TROP*.SFM are kept beside it (Playnite Achievements reads its language's).
++ * Returns the files written, -1 on an error. */
++int trophy_folder_install(const char* dir, const trp_index* t, const char* lang_file);
++/* TROPUSR.DAT in `dir`. merge = 0: written from our state. merge = 1 (someone
++ * else's folder): an existing valid file is merged into (tropusr_merge, written only
++ * when something changed, a copy kept once as TROPUSR.DAT.port-backup); a missing
++ * one is written from our state; an invalid one is left alone (-1). Returns 1 written,
++ * 0 nothing to do, -1 error. */
++int trophy_folder_write_usr(const char* dir, const trophy_set* s, const uint8_t* unlocked,
++                            const uint64_t* unix_secs, int merge);
++/* Where RPCS3 keeps one user's trophies, from what a player may give: the RPCS3
++ * folder (the one with dev_hdd0, or its portable/ folder), its dev_hdd0, a
++ * home/<user> folder or that user's trophy folder. 1 = `out` is the home/<user>
++ * folder (it exists). */
++int trophy_rpcs3_home(const char* given, char* out, size_t n);
++/* The pack of trophy folder `folder` ("NPWR01730_00"): <disc_root>/PS3_GAME/TROPDIR/
++ * <folder>/TROPHY.TRP (or <disc_root>/TROPDIR/...), else <hdd0_root>/game/<any>/
++ * TROPDIR/<folder>/TROPHY.TRP. 1 = found, its path in `out`. */
++int trophy_find_trp(const char* disc_root, const char* hdd0_root, const char* folder, char* out, size_t n);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/libs/system/cellSysutil.c b/libs/system/cellSysutil.c
+index c4eb87db..dd50a3e6 100644
+--- a/libs/system/cellSysutil.c
++++ b/libs/system/cellSysutil.c
+@@ -412,6 +412,8 @@ static s32 sysutil_language(void)
+     return lang;
+ }
+ 
++s32 ps3_sysutil_language(void) { return sysutil_language(); }
++
+ s32 cellSysutilGetSystemParamInt(s32 id, u32 value_ea)
+ {
+     if (!value_ea)
+diff --git a/libs/system/cellSysutil.h b/libs/system/cellSysutil.h
+index 97a370ac..4e600843 100644
+--- a/libs/system/cellSysutil.h
++++ b/libs/system/cellSysutil.h
+@@ -115,6 +115,7 @@ s32 cellSysutilUnregisterCallback(s32 slot);
+ s32 cellSysutilCheckCallback(void);
+ s32 cellSysutilQueueGuestCallbackArgs(u32 opd, const u64 args[8]);
+ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
++s32 ps3_sysutil_language(void);
+ 
+ /* Internal HLE completion queue, delivered by the guest's next callback poll. */
+ s32 cellSysutilQueueGuestCallback(u32 opd, u64 arg0, u64 arg1);
+-- 
+2.54.0 (Apple Git-157)
+

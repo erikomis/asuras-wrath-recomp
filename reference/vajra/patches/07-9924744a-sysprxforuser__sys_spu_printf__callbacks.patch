@@ -1,0 +1,78 @@
+From 9924744abdd889c3d31ca58ca8b7a0fe608384db Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:11:18 +0200
+Subject: [PATCH] sysPrxForUser: _sys_spu_printf_* callbacks
+
+initialize records the four guest callbacks, finalize clears them, and the
+attach/detach group/thread calls invoke the matching callback and return its
+result, or CELL_ESTAT when none is registered.
+---
+ libs/system/sysPrxForUser.c | 34 ++++++++++++++++++++++++++++++++++
+ libs/system/sysPrxForUser.h |  6 ++++++
+ 2 files changed, 40 insertions(+)
+
+diff --git a/libs/system/sysPrxForUser.c b/libs/system/sysPrxForUser.c
+index 4aeaee66..5d3bbb62 100644
+--- a/libs/system/sysPrxForUser.c
++++ b/libs/system/sysPrxForUser.c
+@@ -495,6 +495,40 @@ s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
+     return CELL_OK;
+ }
+ 
++static volatile u32 s_spu_printf_cb[4];
++
++static s32 spu_printf_callback(unsigned which, u32 arg)
++{
++    const u32 opd = s_spu_printf_cb[which];
++    if (!opd)
++        return (s32)CELL_ESTAT;
++    uint64_t r3 = 0;
++    if (!ppu_guest_call_ct_checked(vm_read32(opd), vm_read32(opd + 4), arg, 0, 0, 0, 0, 0, 0, 0, &r3))
++        return (s32)CELL_ESTAT;
++    return (s32)(u32)r3;
++}
++
++s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb)
++{
++    s_spu_printf_cb[0] = agcb;
++    s_spu_printf_cb[1] = dgcb;
++    s_spu_printf_cb[2] = atcb;
++    s_spu_printf_cb[3] = dtcb;
++    return CELL_OK;
++}
++
++s32 _sys_spu_printf_finalize(void)
++{
++    for (unsigned i = 0; i < 4; i++)
++        s_spu_printf_cb[i] = 0;
++    return CELL_OK;
++}
++
++s32 _sys_spu_printf_attach_group(u32 group)   { return spu_printf_callback(0, group); }
++s32 _sys_spu_printf_detach_group(u32 group)   { return spu_printf_callback(1, group); }
++s32 _sys_spu_printf_attach_thread(u32 thread) { return spu_printf_callback(2, thread); }
++s32 _sys_spu_printf_detach_thread(u32 thread) { return spu_printf_callback(3, thread); }
++
+ s32 sys_lwmutex_create(sys_lwmutex_t_hle* lwmutex, const sys_lwmutex_attribute_t* attr)
+ {
+     YZ_XLAT(lwmutex, sys_lwmutex_t_hle*);
+diff --git a/libs/system/sysPrxForUser.h b/libs/system/sysPrxForUser.h
+index 30290c73..2c8868f4 100644
+--- a/libs/system/sysPrxForUser.h
++++ b/libs/system/sysPrxForUser.h
+@@ -98,6 +98,12 @@ s32 sys_process_is_spu_lock_line_reservation_address(u32 addr, u64 flags);
+  * -----------------------------------------------------------------------*/
+ 
+ s32 _sys_printf(const char* fmt, ...);
++s32 _sys_spu_printf_initialize(u32 agcb, u32 dgcb, u32 atcb, u32 dtcb);
++s32 _sys_spu_printf_finalize(void);
++s32 _sys_spu_printf_attach_group(u32 group);
++s32 _sys_spu_printf_detach_group(u32 group);
++s32 _sys_spu_printf_attach_thread(u32 thread);
++s32 _sys_spu_printf_detach_thread(u32 thread);
+ /* NID 0x9FB6228E -- the abort half of the SDK internal assertion macro. */
+ s32 _sys_trap_process(const char* msg);
+ s32 _sys_sprintf(char* buf, const char* fmt, ...);
+-- 
+2.54.0 (Apple Git-157)
+

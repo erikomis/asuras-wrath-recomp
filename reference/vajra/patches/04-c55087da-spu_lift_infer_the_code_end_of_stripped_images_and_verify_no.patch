@@ -1,0 +1,115 @@
+From c55087da955c47ffc154f5129343f29a5dd21cfb Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 10:38:52 +0200
+Subject: [PATCH] SPU lift: infer the code end of stripped images and verify
+ nothing references past it
+
+---
+ tools/find_spu_functions.py   | 31 +++++++++++++++++++++++++++++++
+ tools/spu_lifter.py           |  9 ++++++++-
+ tools/spu_program_pipeline.py | 10 +++++++---
+ 3 files changed, 46 insertions(+), 4 deletions(-)
+
+diff --git a/tools/find_spu_functions.py b/tools/find_spu_functions.py
+index af16afd8..315ea219 100644
+--- a/tools/find_spu_functions.py
++++ b/tools/find_spu_functions.py
+@@ -714,6 +714,37 @@ def detect_functions(buf, base_override=None, verbose=True, raw=False):
+     return cleaned, (text_off, base, len(code))
+ 
+ 
++_TAIL_STOPS = {"bi", "br", "bra", "stop", "stopd"}
++
++
++def infer_code_end(buf):
++    elf = parse_elf(buf)
++    if any((sh["flags"] & SHF_EXECINSTR) and sh["size"] for sh in elf["shs"]):
++        return 0
++    code, base = text_image(buf, elf["phs"])
++    end = base + len(code)
++    insns = disassemble_spu(code, base_addr=base)
++    first = next((i.addr for i in insns if i.mnemonic == ".word"), None)
++    if first is None:
++        return 0
++    stops = [i.addr for i in insns if i.addr < first and i.mnemonic in _TAIL_STOPS]
++    if not stops:
++        return 0
++    ce = max(stops) + 4
++    below = [i for i in insns if i.addr < ce]
++    by_addr = {i.addr: i for i in insns}
++    refs = (collect_branch_targets(below)
++            | collect_link_register_targets(below)
++            | collect_computed_branch_targets(below)
++            | collect_jump_table_targets(below, code, base, end)
++            | collect_ila_continuation_targets(below, base, end)
++            | collect_duff_targets(below, base, end)
++            | collect_function_pointer_tables(buf, elf["phs"], base, end, by_addr))
++    if ce <= elf["entry"] < end or any(ce <= t < end for t in refs):
++        return 0
++    return ce
++
++
+ def main():
+     p = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+diff --git a/tools/spu_lifter.py b/tools/spu_lifter.py
+index 4610a361..69e1a739 100644
+--- a/tools/spu_lifter.py
++++ b/tools/spu_lifter.py
+@@ -1226,10 +1226,17 @@ def main() -> None:
+     args = p.parse_args()
+ 
+     if args.auto_functions:
+-        from find_spu_functions import detect_functions, parse_elf, pick_text, text_image
++        from find_spu_functions import detect_functions, infer_code_end, parse_elf, pick_text, text_image
+         with open(args.auto_functions, "rb") as f:
+             elf_buf = f.read()
+         funcs, (text_off, base, size) = detect_functions(elf_buf)
++        if not args.code_end:
++            inferred = infer_code_end(elf_buf)
++            if inferred:
++                args.code_end = inferred
++                sys.stderr.write("[spu_lifter] no executable sections: code ends at 0x%X, "
++                                 "the first undecodable word follows and nothing in the code "
++                                 "references past it\n" % inferred)
+         data, _ = text_image(elf_buf, parse_elf(elf_buf)["phs"])
+         if args.base != 0:
+             base = args.base  # caller override
+diff --git a/tools/spu_program_pipeline.py b/tools/spu_program_pipeline.py
+index 36cbc240..cfd5c221 100644
+--- a/tools/spu_program_pipeline.py
++++ b/tools/spu_program_pipeline.py
+@@ -19,7 +19,7 @@ def sha256(buf):
+     return hashlib.sha256(buf).hexdigest()
+ 
+ 
+-def code_ranges(info):
++def code_ranges(info, blob=None):
+     # The loader applies every PT_LOAD in header order, including zero filling.
+     # Lifting a segment in isolation is unsafe if another load can replace its
+     # bytes. Treat any overlapping memory layout as unsupported until generation
+@@ -34,7 +34,11 @@ def code_ranges(info):
+     segment = executable[0]
+     start, end = segment['addr'], segment['addr'] + segment['filesz']
+     sections = [s for s in info['sections'] if s['flags'] & 4 and s['size']]
+-    ranges = sorted((s['addr'], s['addr'] + s['size']) for s in sections) or [(start, end)]
++    ranges = sorted((s['addr'], s['addr'] + s['size']) for s in sections)
++    if not ranges:
++        from find_spu_functions import infer_code_end
++        inferred = infer_code_end(blob) if blob is not None else 0
++        ranges = [(start, inferred if start < inferred <= end else end)]
+     if any(a < start or b > end for a, b in ranges):
+         raise ValueError('executable sections outside supported text segment')
+     if any(b > c for (_, b), (c, _) in zip(ranges, ranges[1:])):
+@@ -180,7 +184,7 @@ def build_programs(args, registry_writer):
+             blob, info = blobs[digest], layouts[digest]
+             (outdir / 'image.elf').write_bytes(blob)
+             try:
+-                ranges = code_ranges(info)
++                ranges = code_ranges(info, blob)
+                 functions, (offset, base, size) = detect_functions(blob, verbose=False)
+                 bounds = sorted({(max(s, a), min(e, b)) for s, e in functions for a, b in ranges
+                                  if max(s, a) < min(e, b)})
+-- 
+2.54.0 (Apple Git-157)
+

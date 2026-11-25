@@ -1,0 +1,27 @@
+From 4210c579778f9411ad48408eff1103a24bc4474b Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 02:19:03 +0200
+Subject: [PATCH] spu_coherency.h: declare the sequence-checked GETLLAR fast
+ path
+
+---
+ runtime/spu/spu_coherency.h | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index ea2e8351..5798ef32 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -55,7 +55,8 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
+  * lock, when ctx is already a registered holder and ea's line already marked.
+  * Returns 0 when the caller must take the lock and call spu_coh_reserve
+  * instead. On 1 the caller copies the line, also without the lock. */
+-int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea);
++int spu_coh_reserve_fast(spu_context* ctx, uint32_t ea, uint32_t* seq);
++int spu_lockline_unchanged(uint32_t seq);
+ 
+ /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+-- 
+2.54.0 (Apple Git-157)
+

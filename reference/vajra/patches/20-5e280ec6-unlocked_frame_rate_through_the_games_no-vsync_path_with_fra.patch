@@ -1,0 +1,100 @@
+From 5e280ec67e1ba660e69741dc80c8327c6812c95b Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 06:00:36 +0200
+Subject: [PATCH] Unlocked frame rate through the game's no-vsync path, with
+ frame-rate-independent QTE and per-tick gameplay sites
+
+---
+ libs/video/rsx_core.c |  8 ++++++++
+ libs/video/rsx_core.h | 14 ++++++++++++++
+ 2 files changed, 22 insertions(+)
+
+diff --git a/libs/video/rsx_core.c b/libs/video/rsx_core.c
+index fb3fb28c..2460a242 100644
+--- a/libs/video/rsx_core.c
++++ b/libs/video/rsx_core.c
+@@ -64,6 +64,7 @@ static struct {
+     volatile u32 flip_status;
+     volatile u64 last_flip_time;
+     volatile u32 frames;
++    int free_flips;
+ 
+     SRWLOCK vblank_lock;
+     CONDITION_VARIABLE vblank_cv;
+@@ -652,6 +653,7 @@ void rsx_core_init(u32 local_size, u32 main_size)
+     s.sema4097_ctx = RSX_DMA_SEMAPHORE_RW;
+     s.report_ctx = RSX_DMA_REPORT_LOCAL;
+     s.vsync = 1;
++    s.free_flips = getenv("PS3_FREE_FLIPS") != NULL;
+     s.flip_status = 0;
+     memset(s.display, 0, sizeof s.display);
+     s.display_mask = 0;
+@@ -668,6 +670,7 @@ void rsx_core_init(u32 local_size, u32 main_size)
+ }
+ 
+ void rsx_core_set_renderer(const rsx_renderer* renderer) { s.renderer = renderer; }
++int rsx_core_free_flips(void) { return s.free_flips; }
+ void rsx_core_set_event_sink(rsx_event_sink sink) { s.sink = sink; }
+ 
+ static void rsx_thread(LPTHREAD_START_ROUTINE fn, SIZE_T stack, int priority, const wchar_t* name)
+@@ -731,6 +734,11 @@ void rsx_core_wrote(u32 ea, u32 size)
+     if (s.renderer && s.renderer->wrote) s.renderer->wrote(s.renderer->user, ea, size);
+ }
+ 
++int rsx_core_blit(const rsx_blit* b)
++{
++    return s.renderer && s.renderer->blit && s.renderer->blit(s.renderer->user, b);
++}
++
+ int rsx_io_map(u32 ea, u32 io, u32 size)
+ {
+     if ((ea | io | size) & 0xFFFFFu) return -1;
+diff --git a/libs/video/rsx_core.h b/libs/video/rsx_core.h
+index df2ccca4..f94ea044 100644
+--- a/libs/video/rsx_core.h
++++ b/libs/video/rsx_core.h
+@@ -51,6 +51,17 @@ typedef struct rsx_display_buffer {
+     u32 height;
+ } rsx_display_buffer;
+ 
++typedef struct rsx_blit {
++    u32 src_ea;
++    u32 src_pitch;
++    float src_x0, src_y0, src_x1, src_y1;
++    u32 dst_ea;
++    u32 dst_pitch;
++    u32 dst_x, dst_y, dst_w, dst_h;
++    u32 bpp;
++    int bilinear;
++} rsx_blit;
++
+ typedef struct rsx_renderer {
+     void* user;
+     int  (*open)(void* user);
+@@ -62,6 +73,7 @@ typedef struct rsx_renderer {
+     void (*present)(void* user, u32 buffer, const rsx_display_buffer* display);
+     void (*read_back)(void* user, u32 ea, u32 size);
+     void (*wrote)(void* user, u32 ea, u32 size);
++    int  (*blit)(void* user, const rsx_blit* b);
+     void (*vblank)(void* user, u64 count);
+     void (*close)(void* user);
+ } rsx_renderer;
+@@ -91,6 +103,7 @@ int  rsx_core_display_buffer(u32 id, rsx_display_buffer* out);
+ u32  rsx_core_display_buffer_count(void);
+ u32  rsx_core_current_display_buffer(void);
+ void rsx_core_set_vsync(int vsync);
++int  rsx_core_free_flips(void);
+ void rsx_core_flip_immediate(u32 buffer);
+ u32  rsx_core_flip_status(void);
+ void rsx_core_set_flip_status(u32 status);
+@@ -106,6 +119,7 @@ void rsx_core_raise(enum rsx_event event, u32 arg);
+ void rsx_mem_store(u32 ea, const void* src, u32 size);
+ void rsx_core_read_back(u32 ea, u32 size);
+ void rsx_core_wrote(u32 ea, u32 size);
++int rsx_core_blit(const rsx_blit* b);
+ 
+ #ifdef __cplusplus
+ }
+-- 
+2.54.0 (Apple Git-157)
+

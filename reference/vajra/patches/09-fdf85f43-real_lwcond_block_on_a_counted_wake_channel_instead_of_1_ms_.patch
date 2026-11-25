@@ -1,0 +1,281 @@
+From fdf85f43b301bf0eafd563967a26d0880d986238 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 20:03:49 +0200
+Subject: [PATCH] Real lwcond: block on a counted wake channel instead of 1 ms
+ polling
+
+sys_lwcond_signal/signal_all were no-ops and sys_lwcond_wait released the
+mutex, slept 1 ms and reacquired, so every handshake through a condition
+variable cost a scheduler tick. Waiters now register under the mutex and
+block until signalled or timed out (ETIMEDOUT), signal_to is implemented,
+and destroy reports EBUSY while threads wait. The global shader cache step
+at boot drops from 4.6 s to 40 ms; the loading movie starts at 0.7 s.
+File opens carry a timestamp in the log.
+---
+ libs/video/vk/rsx_vk.cpp   |  35 ++++++++++-
+ runtime/ppu/ppu_fs.cpp     |   4 +-
+ runtime/ppu/ppu_sysprx.cpp | 116 +++++++++++++++++++++++++------------
+ 3 files changed, 117 insertions(+), 38 deletions(-)
+
+diff --git a/libs/video/vk/rsx_vk.cpp b/libs/video/vk/rsx_vk.cpp
+index 983a0a29..a0059416 100644
+--- a/libs/video/vk/rsx_vk.cpp
++++ b/libs/video/vk/rsx_vk.cpp
+@@ -13,6 +13,7 @@
+ 
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <atomic>
+ #include <condition_variable>
+ #include <cstdlib>
+@@ -175,6 +176,23 @@ bool create_surface()
+ #endif
+ }
+ 
++double since_start()
++{
++    static const auto t0 = std::chrono::steady_clock::now();
++    return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
++}
++
++bool stats_on()
++{
++    static const bool on = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
++    return on;
++}
++
++void mark(const char* what)
++{
++    if (stats_on()) std::fprintf(stderr, "[vk] %.3f s %s\n", since_start(), what);
++}
++
+ bool vulkan_open()
+ {
+ #ifdef _WIN32
+@@ -183,18 +201,28 @@ bool vulkan_open()
+     const bool wayland = SDL_GetPointerProperty(SDL_GetWindowProperties(g.window), SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, nullptr) != nullptr;
+     const char* ext[] = { VK_KHR_SURFACE_EXTENSION_NAME, wayland ? VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME : VK_KHR_XLIB_SURFACE_EXTENSION_NAME };
+ #endif
++    mark("window");
+     if (!vk_instance_create(g.d, ext, 2)) return false;
++    mark("instance");
+     if (!create_surface()) {
+         std::fprintf(stderr, "[vk] surface creation failed\n");
+         return false;
+     }
+-    return vk_device_create(g.d, g.surface) && frames_build() && swapchain_build();
++    if (!vk_device_create(g.d, g.surface)) return false;
++    mark("device");
++    if (!frames_build()) return false;
++    mark("renderer");
++    if (!swapchain_build()) return false;
++    mark("swapchain");
++    return true;
+ }
+ 
+ void window_main()
+ {
+     int ok = -1;
++    since_start();
+     if (SDL_InitSubSystem(SDL_INIT_VIDEO)) {
++        mark("sdl video");
+         g.window = SDL_CreateWindow(g.title.c_str(), 1280, 720,
+                                     SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+         if (g.window) {
+@@ -381,6 +409,11 @@ void vk_present(void*, u32, const rsx_display_buffer* db)
+     r = vkQueuePresentKHR(g.d.queue, &pi);
+     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) g.resized = true;
+     g.frame_index = (g.frame_index + 1u) % k_frames;
++    static bool first = true;
++    if (first) {
++        first = false;
++        mark("first present");
++    }
+     static const bool report = [] { const char* e = std::getenv("PS3_VK_STATS"); return e && *e && *e != '0'; }();
+     static uint64_t presents = 0;
+     if (report && ++presents % 120u == 0) {
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 3037be37..76b5a7b3 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -45,6 +45,8 @@
+ #  define FS_TELL64(f)       ((int64_t)_ftelli64(f))
+ typedef struct _stat64 fs_stat64_t;
+ /* _stat64 rejects a trailing slash (MinGW's stat wrapper stripped it). */
++extern "C" unsigned long long ps3_ms_now(void);
++
+ static int FS_STAT64(const char* p, fs_stat64_t* s)
+ {
+     char t[1100]; size_t n = strlen(p);
+@@ -257,7 +259,7 @@ static void cellFsOpen(ppu_context* ctx)
+     g_drm[fd] = drm;
+     g_drm_pos[fd] = 0;
+     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
+-    fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd);
++    fprintf(stderr, "[fs] %llu ms open '%s' -> fd %d\n", ps3_ms_now(), gpath, fd);
+     ctx->gpr[3] = CELL_OK;
+ }
+ 
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index 9e98b1b6..a43e798e 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -157,7 +157,7 @@ static void sys_lwmutex_create(ppu_context* ctx)
+  * we stamp (only the holder ever writes owner=self, so the re-lock check is
+  * race-free). Keyed by guest address in an open-addressed table. */
+ #define LWM_HASH 65536u
+-static struct LwmSlot { volatile long addr; HANDLE sem; volatile long state; } g_lwm[LWM_HASH];
++static struct LwmSlot { volatile long addr; HANDLE sem; volatile long state; HANDLE cv; volatile long waiters; } g_lwm[LWM_HASH];
+ static volatile long g_lwm_tab_lock = 0;
+ static long long lwm_now_us(void){
+     static LARGE_INTEGER freq={0}; if(!freq.QuadPart) QueryPerformanceFrequency(&freq);
+@@ -178,7 +178,9 @@ static struct LwmSlot* lwm_slot(uint32_t addr)
+             while (_InterlockedExchange(&g_lwm_tab_lock, 1)) YieldProcessor();
+             struct LwmSlot* r = nullptr;
+             if (g_lwm[idx].addr == 0) {
+-                g_lwm[idx].sem = CreateSemaphoreA(NULL, 0, 1, NULL);   /* wake channel, empty */
++                g_lwm[idx].sem = CreateSemaphoreA(NULL, 0, 1, NULL);
++                g_lwm[idx].cv = CreateSemaphoreA(NULL, 0, 0x7FFFFFFF, NULL);
++                g_lwm[idx].waiters = 0;
+                 g_lwm[idx].state = 0;                                   /* free */
+                 g_lwm[idx].addr = (long)addr;   /* publish AFTER init (x86 TSO: readers see init) */
+                 r = &g_lwm[idx];
+@@ -328,51 +330,92 @@ static void sys_lwmutex_unlock(ppu_context* ctx)
+     ctx->gpr[3] = 0;
+ }
+ 
+-/* sys_lwcond (sysPrxForUser) — guest-side condition variable, paired with an
+- * lwmutex. The CRT and (newly) libsre's cellSpurs create/wait/signal these. Like
+- * sys_lwmutex above, model it directly in guest memory so the args stay GUEST
+- * EAs (the generic adapter would pass them raw and the C sysPrxForUser impl
+- * deref'd them as host pointers -> AV during cellSpurs init). A no-op wait is
+- * adequate here: the CRT/SPURS paths that reach us use these for one-shot init
+- * handshakes, not long-term blocking. sys_lwcond_t is 8 bytes: +0x00 u32
+- * lwmutex EA, +0x04 u32 lwcond queue id. Titles read +0x00 themselves (an
+- * lwcond whose lwmutex reads 0 is treated as invalid). */
+ static void sys_lwcond_create(ppu_context* ctx)
+ {
+     static uint32_t s_lwcond_id = 0x4C000000u;
+-    uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+-    uint32_t lwmutex = (uint32_t)ctx->gpr[4];
+-    vm_write32(lwcond + 0x00, lwmutex);
++    const uint32_t lwcond = (uint32_t)ctx->gpr[3];
++    vm_write32(lwcond + 0x00, (uint32_t)ctx->gpr[4]);
+     vm_write32(lwcond + 0x04, ++s_lwcond_id);
++    if (struct LwmSlot* cv = lwm_slot(lwcond)) {
++        while (WaitForSingleObject(cv->cv, 0) == WAIT_OBJECT_0) {}
++        cv->waiters = 0;
++    }
++    ctx->gpr[3] = 0;
++}
++static void sys_lwcond_destroy(ppu_context* ctx)
++{
++    struct LwmSlot* cv = lwm_slot((uint32_t)ctx->gpr[3]);
++    ctx->gpr[3] = (cv && cv->waiters > 0) ? (uint64_t)(int64_t)(int32_t)0x8001000Au : 0;
++}
++static int lwcond_wake(struct LwmSlot* cv, long count)
++{
++    for (;;) {
++        const long w = cv->waiters;
++        if (w <= 0) return 0;
++        const long n = count < w ? count : w;
++        if (InterlockedCompareExchange(&cv->waiters, w - n, w) == w) {
++            ReleaseSemaphore(cv->cv, n, NULL);
++            return 1;
++        }
++    }
++}
++static void sys_lwcond_signal(ppu_context* ctx)
++{
++    struct LwmSlot* cv = lwm_slot((uint32_t)ctx->gpr[3]);
++    if (cv) lwcond_wake(cv, 1);
++    ctx->gpr[3] = 0;
++}
++static void sys_lwcond_signal_all(ppu_context* ctx)
++{
++    struct LwmSlot* cv = lwm_slot((uint32_t)ctx->gpr[3]);
++    if (cv) lwcond_wake(cv, 0x7FFFFFFF);
+     ctx->gpr[3] = 0;
+ }
+-static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
+-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
+-/* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
+- * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
+- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+- * common single (non-recursive) hold. */
++static void sys_lwcond_signal_to(ppu_context* ctx)
++{
++    struct LwmSlot* cv = lwm_slot((uint32_t)ctx->gpr[3]);
++    ctx->gpr[3] = (cv && lwcond_wake(cv, 1)) ? 0 : (uint64_t)(int64_t)(int32_t)0x8001000Au;
++}
+ static void sys_lwcond_wait(ppu_context* ctx)
+ {
+-    uint32_t lwcond  = (uint32_t)ctx->gpr[3];
+-    uint32_t lwmutex = vm_read32(lwcond + 0x00);
++    const uint32_t lwcond = (uint32_t)ctx->gpr[3];
++    const uint64_t timeout_us = ctx->gpr[4];
++    const uint32_t lwmutex = vm_read32(lwcond + 0x00);
+     struct LwmSlot* sl = lwm_slot(lwmutex);
+-    if (sl) {
+-        uint32_t own = vm_read32(lwmutex + LWM_OWNER);
+-        uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
+-        vm_write32(lwmutex + LWM_RECUR, 0);
+-        vm_write32(lwmutex + LWM_OWNER, 0);
+-        ppu_thread_note_block(ctx->thread_id);
+-        lwm_release(sl);
+-        Sleep(1);
+-        lwm_acquire(sl, 0);
+-        vm_write32(lwmutex + LWM_OWNER, own);
+-        vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++    struct LwmSlot* cv = lwm_slot(lwcond);
++    if (!sl || !cv) {
++        ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010002u;
++        return;
+     }
+-    ctx->gpr[3] = 0;
++    const uint32_t own = vm_read32(lwmutex + LWM_OWNER);
++    const uint32_t rc = vm_read32(lwmutex + LWM_RECUR);
++    InterlockedIncrement(&cv->waiters);
++    vm_write32(lwmutex + LWM_RECUR, 0);
++    vm_write32(lwmutex + LWM_OWNER, 0);
++    ppu_thread_note_block(ctx->thread_id);
++    lwm_release(sl);
++    DWORD ms = INFINITE;
++    if (timeout_us) {
++        const unsigned long long m = (timeout_us + 999u) / 1000u;
++        ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m;
++    }
++    int timed_out = WaitForSingleObject(cv->cv, ms) != WAIT_OBJECT_0;
++    if (timed_out) {
++        for (;;) {
++            const long w = cv->waiters;
++            if (w <= 0) {
++                WaitForSingleObject(cv->cv, INFINITE);
++                timed_out = 0;
++                break;
++            }
++            if (InterlockedCompareExchange(&cv->waiters, w - 1, w) == w) break;
++        }
++    }
++    lwm_acquire(sl, 0);
++    vm_write32(lwmutex + LWM_OWNER, own);
++    vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
++    ctx->gpr[3] = timed_out ? (uint64_t)(int64_t)(int32_t)0x8001000Bu : 0;
+ }
+-
+ /* sys_ppu_thread_get_id(vm::ptr<u64> id) -> *id = calling thread's real id.
+  * The old fixed "1" broke every am-I-the-designated-thread check in
+  * multithreaded titles (LBP's job system routes work by thread identity, so
+@@ -641,6 +684,7 @@ extern "C" void ppu_sysprx_register(void)
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal"),     "sys_lwcond_signal",     sys_lwcond_signal);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_all"), "sys_lwcond_signal_all", sys_lwcond_signal_all);
+     ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_wait"),       "sys_lwcond_wait",       sys_lwcond_wait);
++    ps3_hle_register_ctx(ps3_compute_nid("sys_lwcond_signal_to"),  "sys_lwcond_signal_to",  sys_lwcond_signal_to);
+ 
+     /* Thread id + memory manager (high-frequency boot imports). The flat VM
+      * means map/unmap/free are no-ops: the memory already exists everywhere. */
+-- 
+2.54.0 (Apple Git-157)
+

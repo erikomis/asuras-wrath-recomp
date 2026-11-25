@@ -1,0 +1,483 @@
+From 45c31c77e7e83efa06653737dbf0636f88c89082 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:11:18 +0200
+Subject: [PATCH] toolkit: firmware-accurate NetCtl, memory map, user memory
+ size and cellOvis
+
+- cellNetCtl: offline GetState reports Disconnected with CELL_OK and GetInfo
+  returns NOT_CONNECTED (except the ethernet address), as lv2 does.
+- vm.h: move the HLE heap, audio and sys_vm windows to 0xA0000000+, so title
+  reservations land at 0x40000000/0x50000000 like on hardware.
+- syscall 352 returns the real sys_memory_get_user_memory_size accounting.
+- sys_memory: log mmapper reservations, shared memory and every ENOMEM with
+  the guest call chain.
+- cellOvis: the real two-function API (GetOverlayTableSize and
+  InitializeOverlayTable) with its error codes; overlay ELFs are validated.
+---
+ docs/MODULES_REFERENCE.md          |   2 +-
+ docs/MODULE_STATUS.md              |   2 +-
+ libs/audio/tests/test_audio_ring.c |   8 +--
+ libs/misc/cellOvis.c               | 109 +++++++++++++++--------------
+ libs/misc/cellOvis.h               |  30 ++------
+ libs/network/cellNetCtl.c          |  15 ++--
+ runtime/memory/vm.h                |   6 +-
+ runtime/ppu/ppu_loader.cpp         |   9 +--
+ runtime/syscalls/sys_memory.c      |  72 ++++++++++++++++---
+ 9 files changed, 144 insertions(+), 109 deletions(-)
+
+diff --git a/docs/MODULES_REFERENCE.md b/docs/MODULES_REFERENCE.md
+index 7c037ede..511c70a2 100644
+--- a/docs/MODULES_REFERENCE.md
++++ b/docs/MODULES_REFERENCE.md
+@@ -1048,7 +1048,7 @@ Checks whether Remote Play streaming is available. Always reports unavailable in
+ |--------|---------|----------------|
+ | **cellScreenshot** | Screenshot capture | Enable/disable flag, parameter/overlay tracking |
+ | **cellBGDL** | Background downloads | Init/term, download list always empty |
+-| **cellOvis** | Overlay system | Init/term, create/destroy (no-op) |
++| **cellOvis** | SPU overlays | Overlay table size/initialisation; images without overlays only |
+ | **cellSheap** | Shared heap allocator | Bump allocator with block tracking, up to 8 heaps |
+ | **cellLicenseArea** | License region check | Americas default, all regions valid |
+ | **cellMusicDecode/2** | Music decoding | Init/finish, decode returns NOT_SUPPORTED |
+diff --git a/docs/MODULE_STATUS.md b/docs/MODULE_STATUS.md
+index 06ef76e9..627d90cd 100644
+--- a/docs/MODULE_STATUS.md
++++ b/docs/MODULE_STATUS.md
+@@ -153,7 +153,7 @@ Status of HLE (High-Level Emulation) implementations for PS3 system modules in p
+ | Module | Category | Status | Notes |
+ |---|---|---|---|
+ | cellRtc | Real-Time Clock | **Complete** | Host time -> PS3 ticks, DateTime, time arithmetic, RFC formatting, day-of-week |
+-| cellOvis | Overlay | **Complete** | Init/term, overlay create/destroy/invalidate (no-op stubs) |
++| cellOvis | SPU overlays | Partial | GetOverlayTableSize / InitializeOverlayTable for SPU ELFs without overlay segments (size 0); overlay tables not implemented |
+ | cellSheap | Shared Heap | **Complete** | Bump allocator with block tracking, alloc/free/query, up to 8 heaps |
+ | cellKey2char | Key to Char | **Complete** | HID scancode to Unicode, US-101 layout, shift/caps handling, dead key mode |
+ | cellSubdisplay | Sub-display | **Complete** | PS Vita Remote Play stub — init/end/start/stop lifecycle, always reports not connected, touch data returns empty |
+diff --git a/libs/audio/tests/test_audio_ring.c b/libs/audio/tests/test_audio_ring.c
+index b6252c94..623898ab 100644
+--- a/libs/audio/tests/test_audio_ring.c
++++ b/libs/audio/tests/test_audio_ring.c
+@@ -44,15 +44,15 @@ int main(void)
+     s_audio_initialized = 1;
+     vm_write64(0x100, 8);
+     vm_write64(0x108, 32);
+-    vm_write64(0x60000000, 0x123456789abcdef0ULL);
++    vm_write64(VM_AUDIO_BASE + VM_AUDIO_SIZE, 0x123456789abcdef0ULL);
+     for (unsigned i = 0; i < CELL_AUDIO_PORT_MAX; ++i) {
+         assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
+         assert(vm_read32(0x200) == i);
+-        assert(s_ports[i].port_addr >= 0x58000000);
+-        assert(s_ports[i].read_idx_addr + 8 <= 0x59000000);
++        assert(s_ports[i].port_addr >= VM_AUDIO_BASE);
++        assert(s_ports[i].read_idx_addr + 8 <= VM_AUDIO_BASE + VM_AUDIO_SIZE);
+         if (i) assert(s_ports[i].port_addr > s_ports[i-1].read_idx_addr);
+     }
+-    assert(vm_read64(0x60000000) == 0x123456789abcdef0ULL);
++    assert(vm_read64(VM_AUDIO_BASE + VM_AUDIO_SIZE) == 0x123456789abcdef0ULL);
+     u64 first = s_ports[0].port_addr;
+     assert(cellAudioPortClose(0) == CELL_OK);
+     assert(cellAudioPortOpen((void*)0x100, (void*)0x200) == CELL_OK);
+diff --git a/libs/misc/cellOvis.c b/libs/misc/cellOvis.c
+index 7e6968a0..180f9479 100644
+--- a/libs/misc/cellOvis.c
++++ b/libs/misc/cellOvis.c
+@@ -1,65 +1,70 @@
+-/*
+- * ps3recomp - cellOvis HLE implementation
+- *
+- * Stub. Init/term work, overlay creation succeeds as no-op.
+- */
+-
+ #include "cellOvis.h"
+ #include <stdio.h>
+-#include "../../runtime/ppu/ppu_memory.h"   /* vm_write*: guest EA -> host, byte-swapped */
+-
+-/* Internal state */
+-
+-static int s_initialized = 0;
+-static u32 s_next_handle = 1;
++#include "../../runtime/ppu/ppu_memory.h"
+ 
+-/* API */
++#define SPU_ELF_MACHINE 23
++#define PT_LOAD_TYPE    1
+ 
+-s32 cellOvisInit(void)
++static int spu_overlay_segments(u32 elf, u32* overlays)
+ {
+-    printf("[cellOvis] Init()\n");
+-    if (s_initialized)
+-        return (s32)CELL_OVIS_ERROR_ALREADY_INITIALIZED;
+-    s_initialized = 1;
+-    s_next_handle = 1;
+-    return CELL_OK;
++    if (!elf || vm_read32(elf) != 0x7F454C46u)
++        return 0;
++    if ((vm_read32(elf + 4) >> 16) != 0x0102u || vm_read16(elf + 0x12) != SPU_ELF_MACHINE)
++        return 0;
++    const u32 phoff = vm_read32(elf + 0x1C);
++    const u32 phentsize = vm_read16(elf + 0x2A);
++    const u32 phnum = vm_read16(elf + 0x2C);
++    if (phentsize < 0x20 || phnum > 64)
++        return 0;
++    u32 n = 0;
++    for (u32 i = 0; i < phnum; i++) {
++        const u32 a = elf + phoff + i * phentsize;
++        if (vm_read32(a) != PT_LOAD_TYPE)
++            continue;
++        const u32 va = vm_read32(a + 8), sa = vm_read32(a + 0x14);
++        for (u32 j = 0; j < phnum; j++) {
++            const u32 b = elf + phoff + j * phentsize;
++            if (j == i || vm_read32(b) != PT_LOAD_TYPE)
++                continue;
++            const u32 vb = vm_read32(b + 8), sb = vm_read32(b + 0x14);
++            if (sa && sb && va < vb + sb && vb < va + sa) {
++                n++;
++                break;
++            }
++        }
++    }
++    *overlays = n;
++    return 1;
+ }
+ 
+-s32 cellOvisTerm(void)
++s32 cellOvisGetOverlayTableSize(u32 elf)
+ {
+-    printf("[cellOvis] Term()\n");
+-    s_initialized = 0;
+-    return CELL_OK;
+-}
+-
+-s32 cellOvisGetOverlayTableSize(const char* filePath, u32* tableSize)
+-{
+-    (void)filePath;
+-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
+-    if (!tableSize) return (s32)CELL_OVIS_ERROR_INVALID_ARGUMENT;
+-    vm_write32((u32)(uintptr_t)tableSize, (u32)0);
+-    return CELL_OK;
+-}
+-
+-s32 cellOvisCreateOverlay(const void* table, u32 tableSize, CellOvisHandle* handle)
+-{
+-    (void)table; (void)tableSize;
+-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
+-    if (!handle) return (s32)CELL_OVIS_ERROR_INVALID_ARGUMENT;
+-    vm_write32((u32)(uintptr_t)handle, (u32)s_next_handle++);
+-    return CELL_OK;
+-}
+-
+-s32 cellOvisDestroyOverlay(CellOvisHandle handle)
+-{
+-    (void)handle;
+-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
+-    return CELL_OK;
++    u32 overlays = 0;
++    if (!spu_overlay_segments(elf, &overlays)) {
++        printf("[cellOvis] GetOverlayTableSize(elf=0x%08X) -> INVAL (not an SPU ELF)\n", elf);
++        return (s32)CELL_OVIS_ERROR_INVAL;
++    }
++    if (overlays) {
++        printf("[cellOvis] GetOverlayTableSize(elf=0x%08X): %u overlay segment(s); overlay tables are not implemented\n",
++               elf, overlays);
++        return (s32)CELL_OVIS_ERROR_INVAL;
++    }
++    printf("[cellOvis] GetOverlayTableSize(elf=0x%08X) -> 0 (no overlay segments)\n", elf);
++    return 0;
+ }
+ 
+-s32 cellOvisInvalidateOverlay(CellOvisHandle handle)
++s32 cellOvisInitializeOverlayTable(u32 ea_ovly_table, u32 elf)
+ {
+-    (void)handle;
+-    if (!s_initialized) return (s32)CELL_OVIS_ERROR_NOT_INITIALIZED;
++    u32 overlays = 0;
++    if (!spu_overlay_segments(elf, &overlays)) {
++        printf("[cellOvis] InitializeOverlayTable(table=0x%08X, elf=0x%08X) -> INVAL (not an SPU ELF)\n",
++               ea_ovly_table, elf);
++        return (s32)CELL_OVIS_ERROR_INVAL;
++    }
++    if (overlays) {
++        printf("[cellOvis] InitializeOverlayTable(table=0x%08X, elf=0x%08X): %u overlay segment(s); overlay tables are not implemented\n",
++               ea_ovly_table, elf, overlays);
++        return (s32)CELL_OVIS_ERROR_INVAL;
++    }
+     return CELL_OK;
+ }
+diff --git a/libs/misc/cellOvis.h b/libs/misc/cellOvis.h
+index 550f74d0..8c6348e8 100644
+--- a/libs/misc/cellOvis.h
++++ b/libs/misc/cellOvis.h
+@@ -1,10 +1,3 @@
+-/*
+- * ps3recomp - cellOvis HLE
+- *
+- * System overlay notifications. Stub — init/term work,
+- * overlay operations are no-ops.
+- */
+-
+ #ifndef PS3RECOMP_CELL_OVIS_H
+ #define PS3RECOMP_CELL_OVIS_H
+ 
+@@ -15,26 +8,15 @@
+ extern "C" {
+ #endif
+ 
+-/* Error codes */
+-#define CELL_OVIS_ERROR_NOT_INITIALIZED     0x80410701
+-#define CELL_OVIS_ERROR_ALREADY_INITIALIZED 0x80410702
+-#define CELL_OVIS_ERROR_INVALID_ARGUMENT    0x80410703
+-
+-/* Types */
+-typedef u32 CellOvisHandle;
+-
+-/* Functions */
+-s32 cellOvisInit(void);
+-s32 cellOvisTerm(void);
++#define CELL_OVIS_ERROR_INVAL 0x80410402
++#define CELL_OVIS_ERROR_ABORT 0x8041040C
++#define CELL_OVIS_ERROR_ALIGN 0x80410410
+ 
+-s32 cellOvisGetOverlayTableSize(const char* filePath, u32* tableSize);
+-s32 cellOvisCreateOverlay(const void* table, u32 tableSize, CellOvisHandle* handle);
+-s32 cellOvisDestroyOverlay(CellOvisHandle handle);
+-
+-s32 cellOvisInvalidateOverlay(CellOvisHandle handle);
++s32 cellOvisGetOverlayTableSize(u32 elf);
++s32 cellOvisInitializeOverlayTable(u32 ea_ovly_table, u32 elf);
+ 
+ #ifdef __cplusplus
+ }
+ #endif
+ 
+-#endif /* PS3RECOMP_CELL_OVIS_H */
++#endif
+diff --git a/libs/network/cellNetCtl.c b/libs/network/cellNetCtl.c
+index 8b002ffe..a6b1eb4a 100644
+--- a/libs/network/cellNetCtl.c
++++ b/libs/network/cellNetCtl.c
+@@ -158,15 +158,9 @@ s32 cellNetCtlGetState(s32* state)
+         return CELL_NET_CTL_ERROR_INVALID_ADDR;
+ 
+     if (!netctl_online()) {
+-        /* Offline: FAIL the query rather than report state=Disconnected.
+-         * LBP's connect job (sub_F433C(0)) polls GetState forever until
+-         * IPObtained and only exits on ret<0 -- and the working RPCS3 boot
+-         * shows exactly one GetState call failing with NOT_INITIALIZED,
+-         * after which the game proceeds offline. Still write a sane state
+-         * for callers that ignore the return value. */
+         vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_Disconnected);
+-        printf("[cellNetCtl] GetState() -> error NOT_INITIALIZED (offline mode)\n");
+-        return CELL_NET_CTL_ERROR_NOT_INITIALIZED;
++        printf("[cellNetCtl] GetState() -> Disconnected\n");
++        return CELL_OK;
+     }
+ 
+     vm_write32((uint32_t)(uintptr_t)state, CELL_NET_CTL_STATE_IPObtained);
+@@ -185,6 +179,11 @@ s32 cellNetCtlGetInfo(s32 code, CellNetCtlInfo* info)
+     info = GUEST_PTR(info, CellNetCtlInfo*);
+     memset(info, 0, sizeof(CellNetCtlInfo));
+ 
++    if (!netctl_online() && code != CELL_NET_CTL_INFO_ETHER_ADDR) {
++        printf("[cellNetCtl] GetInfo(code=%d) -> NOT_CONNECTED (offline)\n", code);
++        return CELL_NET_CTL_ERROR_NOT_CONNECTED;
++    }
++
+     switch (code)
+     {
+     case CELL_NET_CTL_INFO_DEVICE:
+diff --git a/runtime/memory/vm.h b/runtime/memory/vm.h
+index bde031ae..f552dd4d 100644
+--- a/runtime/memory/vm.h
++++ b/runtime/memory/vm.h
+@@ -62,12 +62,12 @@ extern "C" {
+ #define VM_PPU_TLS_SIZE     0x00100000u
+ 
+ /* Dedicated guest windows owned by runtime allocators, not LV2 mmapper. */
+-#define VM_HLE_HEAP_BASE    0x50000000u
++#define VM_HLE_HEAP_BASE    0xB0000000u
+ #define VM_HLE_HEAP_SIZE    0x08000000u
+-#define VM_AUDIO_BASE       0x58000000u
++#define VM_AUDIO_BASE       0xB8000000u
+ #define VM_AUDIO_PORT_SIZE  0x00200000u
+ #define VM_AUDIO_SIZE       0x01000000u
+-#define VM_SYS_VM_BASE      0x60000000u
++#define VM_SYS_VM_BASE      0xA0000000u
+ #define VM_SYS_VM_SIZE      0x10000000u
+ 
+ /* Home for guest-visible structures the RUNTIME injects -- the GCM label window,
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 05087f1f..bf6ee541 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3215,6 +3215,7 @@ extern "C" void ppu_unlifted_stub(uint64_t addr, ppu_context* ctx)
+ /* The real lv2 syscall table (runtime/syscalls/lv2_register.c). */
+ extern "C" int lv2_try_syscall(ppu_context* ctx);
+ extern "C" int64_t sys_mmapper_allocate_address(ppu_context* ctx);
++extern "C" int64_t sys_memory_get_user_memory_size(ppu_context* ctx);
+ extern "C" int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out);
+ 
+ /* lv2 syscall dispatch: r11 = syscall number, args in r3.. (PPC ABI).
+@@ -3312,12 +3313,8 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+         fprintf(stderr,"[sc-caller] port_send(port=1) from func_%08X+0x%llX data=0x%08X/0x%08X/0x%08X\n",
+                 bg,(unsigned long long)(tgt-bh),(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]); } }
+     switch (num) {
+-    case 352: {   /* sys_memory_get_user_memory_size(sys_memory_info_t* info)
+-                   * info = { u32 total_user_memory; u32 available_user_memory } */
+-        uint32_t info = (uint32_t)ctx->gpr[3];
+-        if (info) { vm_write32(info + 0, 0x10000000u);   /* 256 MB total */
+-                    vm_write32(info + 4, 0x0C000000u); } /* 192 MB available */
+-        ctx->gpr[3] = 0;
++    case 352: {
++        ctx->gpr[3] = (uint64_t)sys_memory_get_user_memory_size(ctx);
+         return;
+     }
+     case 330: {   /* sys_mmapper_allocate_address(u64 size, u64 flags,
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index 9d112f64..fae809f1 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -102,10 +102,32 @@ static uint32_t user_address(uint32_t size, uint32_t alignment)
+     }
+ }
+ 
++static uint64_t read_be64(uint32_t addr)
++{
++    const uint8_t* p = (const uint8_t*)vm_to_host(addr);
++    uint64_t v = 0;
++    for (int i = 0; i < 8; i++) v = (v << 8) | p[i];
++    return v;
++}
++
++static void log_guest_chain(const ppu_context* ctx)
++{
++    if (!ctx) return;
++    uint32_t sp = (uint32_t)ctx->gpr[1];
++    fprintf(stderr, "[sys_memory]   guest chain: lr=0x%08X", (uint32_t)ctx->lr);
++    for (int depth = 0; depth < 32; depth++) {
++        uint32_t next = (uint32_t)read_be64(sp);
++        if (next <= sp || next >= 0xF0000000u) break;
++        fprintf(stderr, " <- 0x%08X", (uint32_t)read_be64(next + 16));
++        sp = next;
++    }
++    fprintf(stderr, "\n");
++}
++
+ /* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
+  * is the process's main pool; a container's allocations are also charged to
+  * that container (its used_size), checked against its total. */
+-static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
++static int64_t memory_allocate(const ppu_context* ctx, uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
+ {
+     uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
+     uint64_t rounded = (requested + alignment - 1u) & ~(uint64_t)(alignment - 1u);
+@@ -114,7 +136,11 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
+     uint32_t size = (uint32_t)rounded;
+     bump_lock();
+     if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
++        bump_unlock();
++        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM (0x%X of 0x%X in use)\n",
++                size, s_total_allocated, SYS_MEM_USER_TOTAL);
++        log_guest_chain(ctx);
++        return (int64_t)(int32_t)CELL_ENOMEM;
+     }
+     sys_mem_container_info* ct = NULL;
+     if (cid) {
+@@ -128,7 +154,11 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
+         if (!g_sys_mem_allocs[i].active) { slot = i; break; }
+     uint32_t addr = slot < 0 ? 0 : user_address(size, alignment);
+     if (!addr || vm_commit(addr, size) != CELL_OK) {
+-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
++        bump_unlock();
++        fprintf(stderr, "[sys_memory] allocate(size=0x%X) -> ENOMEM (%s)\n", size,
++                slot < 0 ? "allocation table full" : !addr ? "no address range" : "commit failed");
++        log_guest_chain(ctx);
++        return (int64_t)(int32_t)CELL_ENOMEM;
+     }
+     memset(vm_to_host(addr), 0, size);
+     sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
+@@ -145,7 +175,7 @@ static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid,
+ 
+ int64_t sys_memory_allocate(ppu_context* ctx)
+ {
+-    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
++    return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -162,10 +192,10 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
+ {
+     uint32_t cid = LV2_ARG_U32(ctx, 1);
+     if (cid == SYS_MEMORY_CONTAINER_DEFAULT)
+-        return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
++        return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), 0, LV2_ARG_PTR(ctx, 3));
+     if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
+         return (int64_t)(int32_t)CELL_ESRCH;
+-    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
++    return memory_allocate(ctx, LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 2), cid, LV2_ARG_PTR(ctx, 3));
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -403,7 +433,14 @@ int64_t sys_mmapper_allocate_address(ppu_context* ctx)
+         r->start = r->next = addr; r->end = s_mapper_bump_ptr;
+     }
+     bump_unlock();
+-    if (!addr) return (int64_t)(int32_t)CELL_ENOMEM;
++    if (!addr) {
++        fprintf(stderr, "[sys_mmapper] allocate_address(size=0x%llX, align=0x%llX) -> ENOMEM\n",
++                (unsigned long long)size, (unsigned long long)alignment);
++        return (int64_t)(int32_t)CELL_ENOMEM;
++    }
++    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
++        fprintf(stderr, "[sys_mmapper] allocate_address(size=0x%llX, align=0x%llX) -> 0x%08X\n",
++                (unsigned long long)size, (unsigned long long)alignment, addr); }
+     if (out) write_be32(out, addr);
+     return CELL_OK;
+ }
+@@ -430,8 +467,13 @@ int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t*
+     addr = (addr + 0xFFFFFu) & ~0xFFFFFull;
+     uint64_t end = (addr + size + 0xFFFFFu) & ~0xFFFFFull;
+     if (end > found->end || vm_commit((uint32_t)addr, size) != CELL_OK) {
+-        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
++        bump_unlock();
++        fprintf(stderr, "[sys_mmapper] search_and_map(start=0x%08X, size=0x%X) -> ENOMEM (%s)\n", start, size,
++                end > found->end ? "reservation exhausted" : "commit failed");
++        return (int64_t)(int32_t)CELL_ENOMEM;
+     }
++    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
++        fprintf(stderr, "[sys_mmapper] search_and_map(start=0x%08X, size=0x%X) -> 0x%08X\n", start, size, (uint32_t)addr); }
+     found->next = (uint32_t)end;
+     *out = (uint32_t)addr;
+     bump_unlock(); return CELL_OK;
+@@ -469,8 +511,14 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
+     for (int i = 0; i < SYS_MMAPPER_SHARED_MAX; i++) {
+         if (!g_sys_mmapper_shared[i].active) { slot = i; break; }
+     }
+-    if (slot < 0)
++    if (slot < 0) {
++        fprintf(stderr, "[sys_mmapper] allocate_shared_memory(size=0x%X) -> EAGAIN (all %d slots in use)\n",
++                size, SYS_MMAPPER_SHARED_MAX);
+         return (int64_t)(int32_t)CELL_EAGAIN;
++    }
++    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
++        fprintf(stderr, "[sys_mmapper] allocate_shared_memory(key=0x%llX, size=0x%X) -> id %d\n",
++                (unsigned long long)key, size, slot + 1); }
+ 
+     sys_mmapper_shared_info* s = &g_sys_mmapper_shared[slot];
+     s->active = 1;
+@@ -566,8 +614,12 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
+ 
+     /* Commit the memory at the specified address */
+     int32_t rc = vm_commit(addr, s->size);
+-    if (rc != CELL_OK)
++    if (rc != CELL_OK) {
++        fprintf(stderr, "[sys_mmapper] map_shared_memory(addr=0x%08X, id=%u) -> 0x%08X\n", addr, shm_id, (unsigned)rc);
+         return (int64_t)(int32_t)rc;
++    }
++    { static int n = 0; if (PS3_LOG_FIRST(n, 256))
++        fprintf(stderr, "[sys_mmapper] map_shared_memory(addr=0x%08X, id=%u, size=0x%X)\n", addr, shm_id, s->size); }
+ 
+     s->addr = addr;
+     memset(vm_to_host(addr), 0, s->size);
+-- 
+2.54.0 (Apple Git-157)
+

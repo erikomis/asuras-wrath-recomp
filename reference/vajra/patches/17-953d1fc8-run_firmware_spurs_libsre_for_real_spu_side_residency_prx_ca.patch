@@ -1,0 +1,704 @@
+From 953d1fc8d8c9f487135287ec75500dc56e20bf8e Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 12:11:18 +0200
+Subject: [PATCH] Run firmware SPURS (libsre) for real: SPU side, residency,
+ PRX call ABI
+
+- tools/lift_firmware_spu.py lifts a relocated firmware module's embedded SPU
+  ELFs and the code bodies it streams into local store, with every absolute
+  stack set (il/ila/lqa $r1) as a stack-reset entry and call return entries.
+  Adapted from the inFAMOUS 2 port's toolkit (SamiEnazi/ps3recomp 70c456e).
+- spu_overlay_register_region_at: a code region lifted for one LS address is
+  resident whenever its own bytes land there, whatever the GET's source (the
+  taskset module loads tasks in pieces and restores them from context saves).
+  A GET of zeros or of the region's own bytes no longer evicts it.
+- Fast indirect dispatch and the drain resume use spu_lifted_lookup, so
+  resident code spans dispatch without the slow path.
+- The taskset syscall intercept is HLE only when no policy code is present at
+  0xA70 (resident spans included); real tasks enter Sony's module.
+- stop 0x101/0x102 unwind to the thread's landing pad; driver unwinds drop
+  stale interrupt frames.
+- Blocking channel reads and interpreting unlifted LS code are the default.
+- build_spu_workloads --return-entries / --guest-regions (CMake
+  PS3RECOMP_SPU_RETURN_ENTRIES / PS3RECOMP_SPU_GUEST_REGIONS) for titles whose
+  tasks run under the firmware policy modules.
+- PRX exports run on the caller's r1: the 0x1000 stack drop corrupted every
+  argument passed in the parameter save area (Asura's 14-argument
+  _cellSpursJobChainAttributeInitialize returned INVAL).
+---
+ cmake/PS3RecompSPU.cmake            |   6 +
+ runtime/ppu/ppu_hle.cpp             |  16 +--
+ runtime/spu/spu_channels.c          | 111 ++++++++++++++---
+ runtime/spu/spu_dispatch_mt.c       |  10 +-
+ runtime/spu/spu_drain.c             |   5 +-
+ runtime/spu/spu_overlay_residency.h |   3 +
+ tools/build_spu_workloads.py        |  15 ++-
+ tools/lift_firmware_spu.py          | 187 ++++++++++++++++++++++++++++
+ tools/spu_program_pipeline.py       |  42 ++++++-
+ 9 files changed, 348 insertions(+), 47 deletions(-)
+ create mode 100644 tools/lift_firmware_spu.py
+
+diff --git a/cmake/PS3RecompSPU.cmake b/cmake/PS3RecompSPU.cmake
+index 5b8a4d5b..41d4023e 100644
+--- a/cmake/PS3RecompSPU.cmake
++++ b/cmake/PS3RecompSPU.cmake
+@@ -11,6 +11,12 @@ function(ps3recomp_generate_spu output_dir)
+     if(PS3RECOMP_SPU_MERGE_CHUNKS)
+         list(APPEND command --merge-chunks)
+     endif()
++    if(PS3RECOMP_SPU_RETURN_ENTRIES)
++        list(APPEND command --return-entries)
++    endif()
++    if(PS3RECOMP_SPU_GUEST_REGIONS)
++        list(APPEND command --guest-regions)
++    endif()
+     foreach(input IN LISTS ARGN)
+         get_filename_component(input "${input}" ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+         list(APPEND command --input "${input}")
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 5148b384..6f96b117 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -664,21 +664,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+             uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
+             ctx->gpr[2] = toc;            /* libsre's own TOC */
+             ctx->ctr    = code;
+-            /* FLOW_REENTRY_ISO: the libsre fn re-enters lifted guest code at the PPU
+-             * caller's r1; if it (or a frameless mid-entry inside it) runs at an
+-             * overlapping frame, its stores clobber the caller's live frame (the
+-             * deserializer this-ptr corruption). Drop r1 to a fresh guard slice so the
+-             * re-entered frame can never overlap the caller. Args are in regs (ABI);
+-             * results go via r3 / guest pointers, so isolating the frame is safe. */
+-            /* Default ON: without isolation the libsre fn runs at the caller's r1 and
+-             * its prologue `std r2,40(r1)` clobbers the caller's reserved TOC slot at
+-             * 0x28(r1) -> caller reloads r2=0 -> null TOC -> func_002B03AC spin -> no
+-             * draws. Isolating r1 to a fresh slice keeps the caller frame intact.
+-             * Opt out with YDKJ_NO_REENTRY_ISO=1. */
+-            { static int _ri=-1; if(_ri<0){ const char* e=getenv("YDKJ_NO_REENTRY_ISO"); _ri = (e && e[0]=='1') ? 0 : 1; }
+-              if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
+-                ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
+-              else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
++            ps3_indirect_call(ctx);
+             /* A real PRX serving this import is a different implementation of it,
+              * so it gets its own prefix rather than reading as the HLE stub. */
+             ps3_msf("prx:0x%08X", nid);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 84b7ac96..d09d62ed 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -214,6 +214,15 @@ void spu_dbg_e60(spu_context* ctx)
+     fflush(stderr);
+ }
+ 
++void spu_stop_exit_check(spu_context* ctx)
++{
++    if (ctx->status == SPU_STATUS_STOPPED_BY_STOP &&
++        (ctx->stop_code == 0x101u || ctx->stop_code == 0x102u) && s_spu_halt_armed) {
++        s_spu_halt_armed = 0;
++        SPU_LONGJMP(s_spu_halt_env, 1);
++    }
++}
++
+ /* SPU `stop` / stop-and-signal. A real SPU stop HALTS the core; the previous
+  * lifted emission only did `status=...; return;`, which unwound ONE frame and
+  * let the caller's service loop keep running -- so a SPURS policy doing
+@@ -234,6 +243,7 @@ void spu_stop(spu_context* ctx)
+     static int s_halt = -1;
+     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
+     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
++    spu_stop_exit_check(ctx);
+     if (s_halt) spu_halt(ctx);
+ }
+ 
+@@ -334,11 +344,13 @@ int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx)
+     case 1:
+         halted = 1;
+         g_spu_trampoline_fn = 0;
++        ctx->irq_frame = 0;
+         break;
+     case 2:
+         /* A one-way guest stack reset invalidates every lifted host caller.
+          * Re-enter its target with the same guest state on the driver stack. */
+         ctx->host_depth = 0;
++        ctx->irq_frame = 0;
+         g_spu_trampoline_fn = 0;
+         spu_indirect_branch(ctx);
+         SPU_DRAIN(ctx);
+@@ -1107,10 +1119,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
+  * spu_ch_wake -- never fabricating a value. Under SPU_LOCKSTEP the wait
+  * releases the run token first (block_begin) so a peer SPU that must post the
+  * awaited data is never blocked on this ctx. A 10 ms re-poll is the missed-wake
+- * safety net. Opt-in (env SPU_CH_BLOCK=1), default OFF while the producers
+- * (mailbox/signal writes, MFC tag-status event raise) are being wired -- until
+- * then blocking a read whose producer is missing would hang, so default stays
+- * legacy non-blocking with zero regression, exactly like the lockstep gate.
++ * safety net. Default ON: the producers (mailbox/signal writes, the MFC
++ * tag-status and lock-line-lost event raises) all wake, and a read that returns
++ * instead of stalling is not what the SPU does -- the SPURS kernel idles in
++ * `rdch SPU_RdEventStat` waiting for its lock line to change, and returning at
++ * once turns every idle kernel into a getllar busy-loop through the lock-line
++ * lock that starves the SPU and PPU threads doing work. SPU_CH_BLOCK=0 restores
++ * the legacy non-blocking read.
+  * ===========================================================================*/
+ /* Set by runtime/spu/spu_raw.c once a raw SPU exists. A raw SPU runs on its own
+  * host thread against a PPU that pokes its mailboxes by MMIO, so an empty
+@@ -1121,7 +1136,7 @@ int g_spu_force_ch_block = 0;
+ static int yz_ch_block(void)
+ {
+     static int v = -1;
+-    if (v < 0) v = getenv("SPU_CH_BLOCK") ? 1 : 0;
++    if (v < 0) { const char* e = getenv("SPU_CH_BLOCK"); v = !(e && e[0] == '0'); }
+     return v || g_spu_force_ch_block;
+ }
+ 
+@@ -2016,6 +2031,22 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     return 1;
+ }
+ 
++#define SPU_OVL_AT_MAX 256
++static struct { uint32_t ea, lsa, span; int image_id; } s_ovl_at[SPU_OVL_AT_MAX];
++static int s_ovl_at_count;
++void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id)
++{
++    if (!span || image_id <= 0 || lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - lsa) return;
++    const int n = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
++    if (n >= SPU_OVL_AT_MAX) {
++        fprintf(stderr, "[spu-ovl] region_at registry full, image %d not registered\n", image_id);
++        return;
++    }
++    s_ovl_at[n].ea = content_ea; s_ovl_at[n].lsa = lsa;
++    s_ovl_at[n].span = span; s_ovl_at[n].image_id = image_id;
++    __atomic_store_n(&s_ovl_at_count, n + 1, __ATOMIC_RELEASE);
++}
++
+ static int spu_overlay_resident_verified(spu_context* ctx, unsigned slot)
+ {
+     int* state = &ctx->resident_code[slot].verify_state;
+@@ -2214,6 +2245,14 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+         uint32_t end = base + ctx->resident_code[slot].size;
+         if (lsa < end && lsa + size > base) {
+             if (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)) {
++                if (!ctx->resident_code[slot].canon) {
++                    const uint32_t lo = lsa > base ? lsa : base;
++                    const uint32_t hi = (lsa + size) < end ? (lsa + size) : end;
++                    const uint8_t* orig = vm_base + ctx->resident_code[slot].source_ea + (lo - base);
++                    uint32_t k = 0;
++                    while (k < hi - lo && !orig[k]) k++;
++                    if (k == hi - lo || !memcmp(ls + (lo - lsa), orig, hi - lo)) continue;
++                }
+                 ctx->resident_code[slot].image_id = 0;
+                 spu_dcache_residency_changed(ctx);
+             } else if (ctx->resident_code[slot].verify_state) {
+@@ -2222,6 +2261,37 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+             }
+         }
+     }
++    const int nat = __atomic_load_n(&s_ovl_at_count, __ATOMIC_ACQUIRE);
++    for (int i = 0; i < nat; i++) {
++        const uint32_t rlo = s_ovl_at[i].lsa, rhi = rlo + s_ovl_at[i].span;
++        const uint32_t lo = lsa > rlo ? lsa : rlo;
++        const uint32_t hi = (lsa + size) < rhi ? (lsa + size) : rhi;
++        if (lo >= hi || (hi - lo < 128 && hi - lo != size)) continue;
++        const uint8_t* q = ls + (lo - lsa);
++        uint32_t k = 0;
++        while (k < hi - lo && !q[k]) k++;
++        if (k == hi - lo || memcmp(q, vm_base + s_ovl_at[i].ea + (lo - rlo), hi - lo)) continue;
++        int have = 0, free_slot = -1;
++        for (unsigned slot = 0; slot < 4; ++slot) {
++            if (ctx->resident_code[slot].image_id == s_ovl_at[i].image_id &&
++                ctx->resident_code[slot].lsa == rlo) have = 1;
++            if (free_slot < 0 && (!ctx->resident_code[slot].image_id || ctx->resident_code[slot].lsa == rlo))
++                free_slot = (int)slot;
++        }
++        if (have) continue;
++        if (free_slot < 0) {
++            fprintf(stderr, "[spu-ovl] no free resident code span for image %d\n", s_ovl_at[i].image_id);
++            continue;
++        }
++        ctx->resident_code[free_slot].lsa = rlo;
++        ctx->resident_code[free_slot].size = s_ovl_at[i].span;
++        ctx->resident_code[free_slot].source_ea = s_ovl_at[i].ea;
++        ctx->resident_code[free_slot].image_id = s_ovl_at[i].image_id;
++        ctx->resident_code[free_slot].verify_state = 0;
++        ctx->resident_code[free_slot].source_index = 0;
++        ctx->resident_code[free_slot].canon = 0;
++        spu_dcache_residency_changed(ctx);
++    }
+     int nsrc = __atomic_load_n(&s_ovl_src_count, __ATOMIC_ACQUIRE);
+     /* Invalidate destination code/residency above even for an unrelated EA.
+      * Acquire count before the signature flag: if this snapshot contains a
+@@ -2762,10 +2832,12 @@ void spu_indirect_branch(spu_context* ctx)
+          * the only alternative to the HLE is the synthesised-stop exit below
+          * -- which is how LBP's audio tasks (images 6/7) ended on their first
+          * syscall and left the loading thread waiting on their event flag. */
+-        int lifted = spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->image_id) ||
+-            (ctx->resident_task && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_task)) ||
+-            (ctx->resident_ovl  && spu_lookup(SPURS_TASKSET_PM_SYSCALL_LS, ctx->resident_ovl));
+-        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted;
++        int lifted = spu_lifted_lookup(ctx, SPURS_TASKSET_PM_SYSCALL_LS) != NULL;
++        const uint32_t at = ((uint32_t)ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS] << 24) |
++                            ((uint32_t)ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS + 1] << 16) |
++                            ((uint32_t)ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS + 2] << 8) |
++                            ctx->ls[SPURS_TASKSET_PM_SYSCALL_LS + 3];
++        int standalone = !ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS && !lifted && at == 0;
+         if (ctx->image_id == 22 || standalone ||
+             (ctx->policy_mode && sc == SPURS_TASKSET_PM_SYSCALL_LS)) {
+             spu_spurs_taskset_syscall(ctx);
+@@ -2944,24 +3016,25 @@ void spu_indirect_branch(spu_context* ctx)
+               } }
+             fflush(stderr);
+         }
+-        /* SPU_INTERP_UNLIFTED=1: if real code is present at the target, run it
+-         * through the interpreter instead of ending the job. No lift can exist
+-         * for a module the title loads at runtime -- You Don't Know Jack's FMOD
+-         * mixer relocates a DSP plugin into local store and calls it -- and the
+-         * interpreter rejoins the compiled path as soon as it reaches a lifted
+-         * address, which is what the plugin's return does. Opt-in so titles
+-         * that reach here on a genuinely bad pc keep the loud stop. */
++        /* If real code is present at the target, run it through the interpreter
++         * instead of ending the job: the SPU executes whatever local store holds.
++         * No lift can exist for code written at runtime -- You Don't Know Jack's
++         * FMOD mixer relocates a DSP plugin into local store and calls it -- and
++         * the interpreter rejoins the compiled path as soon as it reaches a
++         * lifted address. A zero word (stop 0, never written) keeps the loud
++         * stop. SPU_INTERP_UNLIFTED=0 restores the stop for any unlifted target. */
+         { uint32_t p = ctx->pc & SPU_LS_MASK;
+           uint32_t w0 = ((uint32_t)ctx->ls[p] << 24) | ((uint32_t)ctx->ls[p+1] << 16) |
+                         ((uint32_t)ctx->ls[p+2] << 8) | ctx->ls[p+3];
+           static int s_iu = -1;
+-          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = e ? 1 : 0; }
++          if (s_iu < 0) { const char* e = getenv("SPU_INTERP_UNLIFTED"); s_iu = !(e && e[0] == '0'); }
+           if (s_iu && w0) {
+               static int _n = 0;
+               if (PS3_LOG_FIRST(_n, 8))
+                   fprintf(stderr, "[spu] img=%d interpreting unlifted LS 0x%05X "
+                           "(runtime-loaded code)\n", ctx->image_id, p);
+               spu_interp_run(ctx, p);
++              spu_stop_exit_check(ctx);
+               return;
+           } }
+         spu_halt(ctx);
+@@ -3234,8 +3307,10 @@ void spu_indirect_branch(spu_context* ctx)
+      * WWS jobmanager writes a save/restore stub above its static
+      * image and calls it). Interpret the live LS bytes; on success the next
+      * branch re-enters lifted code via the trampoline. */
+-    if (spu_smc_microstep(ctx))
++    if (spu_smc_microstep(ctx)) {
++        spu_stop_exit_check(ctx);
+         return;
++    }
+     /* Cap the unresolved-branch log PER IMAGE: a global cap let one noisy
+      * image (the FMOD mixer's overlay calls) exhaust it and silently hide
+      * every other image's misses -- LBP's loading jobs skipped their command
+diff --git a/runtime/spu/spu_dispatch_mt.c b/runtime/spu/spu_dispatch_mt.c
+index d9f86bb4..914a460b 100644
+--- a/runtime/spu/spu_dispatch_mt.c
++++ b/runtime/spu/spu_dispatch_mt.c
+@@ -14,11 +14,11 @@
+  * image-23 cri hack, lookup miss diagnostics) falls back to the full resolver.
+  */
+ #include "spu_context.h"
++#include "spu_interp.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+-typedef void (*spu_dispatch_fn)(spu_context*);
+-spu_dispatch_fn spu_lookup(uint32_t addr, int image_id);  /* spu_channels.c (exported) */
++typedef spu_lifted_fn spu_dispatch_fn;
+ void spu_indirect_branch(spu_context* ctx);               /* full resolver in the lib */
+ 
+ void spu_indirect_branch_mt(spu_context* ctx)
+@@ -55,11 +55,7 @@ void spu_indirect_branch_mt(spu_context* ctx)
+                   || pc == SPURS_TASKSET_PM_SYSCALL_LS
+                   || ctx->image_id == SPU_RESOLVER_ONLY_IMAGE_ID;
+     if (!special) {
+-        /* Resident overlay first (mirrors the full resolver): streamed plugin
+-         * code owns its LS range; base-image entries at the same address are
+-         * stale bytes and must lose. */
+-        spu_dispatch_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+-        if (!fn) fn = spu_lookup(pc, ctx->image_id);
++        spu_dispatch_fn fn = spu_lifted_lookup(ctx, pc);
+         if (fn) {
+             ctx->pc = pc;
+             __attribute__((musttail)) return fn(ctx);
+diff --git a/runtime/spu/spu_drain.c b/runtime/spu/spu_drain.c
+index 49bc2b94..cdefb5ce 100644
+--- a/runtime/spu/spu_drain.c
++++ b/runtime/spu/spu_drain.c
+@@ -535,7 +535,7 @@ int spu_tailret_enabled(void)
+  * callee comes back on a lifted entry, run it in this drain until the pc
+  * reaches return_pc; only a pc with no lifted code behind it is unwound. */
+ typedef void (*spu_drain_fn)(spu_context*);
+-extern spu_drain_fn spu_lookup(uint32_t addr, int image_id);
++extern spu_drain_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa);
+ 
+ 
+ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+@@ -608,8 +608,7 @@ void spu_drain_call(spu_context* ctx, uint32_t return_pc)
+         }
+         {
+             uint32_t pc = ctx->pc & SPU_LS_MASK;
+-            spu_drain_fn fn = ctx->resident_ovl ? spu_lookup(pc, ctx->resident_ovl) : 0;
+-            if (!fn) fn = spu_lookup(pc, ctx->image_id);
++            spu_drain_fn fn = spu_lifted_lookup(ctx, pc);
+             if (fn) {
+                 { static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
+                     fprintf(stderr, "[spu] drain-resume return_pc=0x%05X at lifted entry 0x%05X img=%d depth=%d ovl=%d\n",
+diff --git a/runtime/spu/spu_overlay_residency.h b/runtime/spu/spu_overlay_residency.h
+index 08af5b11..c257dd2e 100644
+--- a/runtime/spu/spu_overlay_residency.h
++++ b/runtime/spu/spu_overlay_residency.h
+@@ -29,6 +29,9 @@ int spu_overlay_register_verified_region(uint32_t content_ea, uint32_t load_lsa,
+     uint32_t span, int image_id, const spu_overlay_code_segment* code,
+     unsigned count);
+ 
++void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span,
++    int image_id);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/tools/build_spu_workloads.py b/tools/build_spu_workloads.py
+index 2eef378b..96b981b4 100644
+--- a/tools/build_spu_workloads.py
++++ b/tools/build_spu_workloads.py
+@@ -131,6 +131,15 @@ def main():
+                     help="Pass --merge-chunks to spu_lifter.py: each run of chunks from one "
+                          "call target to the next becomes one C function, so branches "
+                          "inside it are gotos instead of trampoline round trips")
++    ap.add_argument("--return-entries", action="store_true",
++                    help="Pass --return-entries to spu_lifter.py: every call return address "
++                         "is an entry, for code a scheduler resumes rather than returns to "
++                         "(SPURS taskset tasks under the firmware policy module)")
++    ap.add_argument("--guest-regions", action="store_true",
++                    help="With --input: register each program's executable segments as code "
++                         "regions at their local-store addresses, sourced from the program's "
++                         "guest EA in the input PPU ELF, so firmware that loads the program "
++                         "itself makes the lift resident")
+     ap.add_argument("--handled", metavar="JSON",
+                     help="With --input: {sha256: reason} for discovered programs another path "
+                          "already provides (an existing registration, an interpreter route). They "
+@@ -203,7 +212,7 @@ def main():
+     write_registry(args, imgs, text_fps)
+ 
+ 
+-def write_registry(args, imgs, text_fps, image_ids=None):
++def write_registry(args, imgs, text_fps, image_ids=None, regions=None):
+     L = []
+     L.append(f"/* {os.path.basename(args.out)} -- GENERATED by tools/build_spu_workloads.py.")
+     L.append(f" * Registers the {len(imgs)} lifted SPU images of \"{args.title}\" with the workload")
+@@ -216,6 +225,8 @@ def write_registry(args, imgs, text_fps, image_ids=None):
+     L.append('#include "spu_workload.h"')
+     L.append("")
+     L.append("extern void spu_begin_image(int image_id);")
++    if regions:
++        L.append("extern void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id);")
+     L.append("")
+     L.append("/* per-image extern decls (prefixed entry fn + recomp_register) */")
+     for img, prefix, fp, ent in imgs:
+@@ -230,6 +241,8 @@ def write_registry(args, imgs, text_fps, image_ids=None):
+         L.append(f"    spu_workload_register_img(0x{fp:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}\");")
+         if text_fps.get(img):  # same entry, keyed by the text segment (raw SPU proxy-DMA load)
+             L.append(f"    spu_workload_register_img(0x{text_fps[img]:016X}ULL, {prefix}spu_func_{ent:08X}, {i}, \"{img}.text\");")
++        for ea, lsa, span in (regions or {}).get(img, []):
++            L.append(f"    spu_overlay_register_region_at(0x{ea:08X}u, 0x{lsa:X}u, 0x{span:X}u, {i});")
+     L.append("    spu_begin_image(0);")
+     L.append("}")
+     if args.constructor:
+diff --git a/tools/lift_firmware_spu.py b/tools/lift_firmware_spu.py
+new file mode 100644
+index 00000000..5efcc099
+--- /dev/null
++++ b/tools/lift_firmware_spu.py
+@@ -0,0 +1,187 @@
++#!/usr/bin/env python3
++import argparse
++import json
++import os
++import re
++import struct
++import subprocess
++import sys
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++sys.path.insert(0, HERE)
++from build_spu_workloads import debase_includes
++from spu_disasm import disassemble_spu
++
++EM_SPU = 23
++
++
++def be16(b, o): return struct.unpack_from(">H", b, o)[0]
++def be32(b, o): return struct.unpack_from(">I", b, o)[0]
++
++
++def spu_elfs(img):
++    out, off = [], img.find(b"\x7FELF")
++    while off != -1:
++        b = img[off:]
++        if len(b) >= 0x34 and b[4] == 1 and b[5] == 2 and be16(b, 18) == EM_SPU:
++            phoff, shoff = be32(b, 0x1C), be32(b, 0x20)
++            phnum, shnum, shent = be16(b, 0x2C), be16(b, 0x30), be16(b, 0x2E)
++            end = shoff + shnum * shent
++            for i in range(phnum):
++                p = phoff + i * 32
++                end = max(end, p + 32, be32(b, p + 4) + be32(b, p + 16))
++            out.append((off, end, be32(b, 0x18)))
++            off = img.find(b"\x7FELF", off + end)
++        else:
++            off = img.find(b"\x7FELF", off + 1)
++    return out
++
++
++def load_segments(elf):
++    phoff, phnum = be32(elf, 0x1C), be16(elf, 0x2C)
++    segs = []
++    for i in range(phnum):
++        p = phoff + i * 32
++        if be32(elf, p) == 1:
++            segs.append((be32(elf, p + 4), be32(elf, p + 8), be32(elf, p + 16)))
++    return segs
++
++
++def code_pointers(elf):
++    out = set()
++    segs = load_segments(elf)
++    for off, va, fs in segs:
++        for k in range(0, fs - 3, 4):
++            w = be32(elf, off + k)
++            if w >= 0x200 and w % 4 == 0 and va <= w < va + fs and be32(elf, off + (w - va)):
++                out.add(w)
++    return sorted(out)
++
++
++def stack_sets(code, ls_base):
++    out = []
++    for i in disassemble_spu(code, base_addr=ls_base):
++        if i.mnemonic in ("il", "ila", "lqa") and re.match(r"\$r1,", i.operands):
++            out.append(i.addr)
++    return out
++
++
++def lifted_entries(src):
++    return {int(m.group(1), 16) for m in re.finditer(r"spu_func_([0-9A-F]{8})\(spu_context\* ctx\) \{", open(src).read())}
++
++
++def run(cmd):
++    r = subprocess.run(cmd, capture_output=True, text=True)
++    if r.returncode:
++        sys.stderr.write(r.stdout + r.stderr)
++        raise SystemExit("failed: " + " ".join(cmd[:3]))
++    return r.stdout + r.stderr
++
++
++def lift(cmd, d):
++    report = os.path.join(d, "lift.json")
++    log = run(cmd + ["--report", report])
++    open(os.path.join(d, "lift.log"), "w").write(log)
++    diag = json.load(open(report))
++    if diag.get("unsupported"):
++        raise SystemExit("%s: unsupported instructions %s" % (d, diag["unsupported"]))
++    src = os.path.join(d, "spu_recomp.c")
++    for f in ("spu_recomp.c", "spu_recomp.h"):
++        debase_includes(os.path.join(d, f))
++    if "/* TODO spu:" in open(src).read():
++        raise SystemExit("%s: unresolved instruction or branch" % d)
++    return src, len(diag.get("functions", []))
++
++
++def main():
++    ap = argparse.ArgumentParser(
++        description="Lift the SPU side of a relocated firmware module: its embedded SPU ELF "
++                    "images, and the code bodies it streams into local store.")
++    ap.add_argument("--image", required=True, help="relocated module image (lift_prx.py <name>_image.bin)")
++    ap.add_argument("--base", required=True, type=lambda x: int(x, 0), help="guest EA the image is loaded at")
++    ap.add_argument("--name", required=True, help="symbol prefix stem, e.g. libsre")
++    ap.add_argument("--first-image-id", type=int, default=100)
++    ap.add_argument("--body", action="append", default=[],
++                    help="OFF:SIZE:LSA:ENTRY:CODELEN (hex) of a code body in the image: lifted at LSA, "
++                         "code bounded by CODELEN, registered as a code region at that address")
++    ap.add_argument("--out", required=True)
++    a = ap.parse_args()
++
++    img = open(a.image, "rb").read()
++    os.makedirs(a.out, exist_ok=True)
++    py = sys.executable
++    lifter = os.path.join(HERE, "spu_lifter.py")
++    regs = []
++    sources = []
++    image_id = a.first_image_id
++
++    for off, size, entry in spu_elfs(img):
++        name = "%s_spu_%05X" % (a.name, off)
++        d = os.path.join(a.out, name)
++        os.makedirs(d, exist_ok=True)
++        elf_bytes = img[off:off + size]
++        elf = os.path.join(d, "image.elf")
++        open(elf, "wb").write(elf_bytes)
++        p = be32(elf_bytes, 0x1C)
++        seg = elf_bytes[be32(elf_bytes, p + 4):be32(elf_bytes, p + 4) + be32(elf_bytes, p + 16)]
++        sets = stack_sets(seg, be32(elf_bytes, p + 8))
++        seeds = sorted(set(code_pointers(elf_bytes)) | set(sets))
++        cmd = [py, lifter, "--auto-functions", elf, "--symbol-prefix", name + "_", "--merge-chunks",
++               "--return-entries", "-o", d, "--extra-funcs", ",".join("0x%X" % x for x in seeds)]
++        src, n = lift(cmd, d)
++        resets = sorted(set(sets) & lifted_entries(src))
++        print("%s: SPU ELF at +0x%X (EA 0x%08X) entry 0x%X, %d functions, image %d, seeds %s, stack resets %s"
++              % (name, off, a.base + off, entry, n, image_id, " ".join("0x%X" % x for x in seeds) or "-",
++                 " ".join("0x%X" % x for x in resets) or "-"))
++        regs.append((name, image_id, None, resets))
++        sources.append(src)
++        image_id += 1
++
++    for spec in a.body:
++        off, size, lsa, entry, codelen = (int(x, 16) for x in spec.split(":"))
++        if codelen > size:
++            raise SystemExit("body +0x%X: CODELEN 0x%X exceeds SIZE 0x%X" % (off, codelen, size))
++        name = "%s_body_%05X" % (a.name, off)
++        d = os.path.join(a.out, name)
++        os.makedirs(d, exist_ok=True)
++        raw = os.path.join(d, "body.bin")
++        open(raw, "wb").write(img[off:off + size])
++        elf = os.path.join(d, "image.elf")
++        run([py, os.path.join(HERE, "wrap_spu_elf.py"), raw, "--entry", hex(entry), "--base", hex(lsa), "--out", elf])
++        sets = stack_sets(img[off:off + codelen], lsa)
++        cmd = [py, lifter, "--auto-functions", elf, "--base", hex(lsa), "--symbol-prefix", name + "_",
++               "--code-end", hex(lsa + codelen), "--merge-chunks", "--return-entries", "-o", d]
++        if sets:
++            cmd += ["--extra-funcs", ",".join("0x%X" % x for x in sets)]
++        src, n = lift(cmd, d)
++        resets = sorted(set(sets) & lifted_entries(src))
++        print("%s: body at +0x%X (EA 0x%08X) code 0x%X of 0x%X -> LS 0x%X, %d functions, image %d, stack resets %s"
++              % (name, off, a.base + off, codelen, size, lsa, n, image_id, " ".join("0x%X" % x for x in resets) or "-"))
++        regs.append((name, image_id, (a.base + off, lsa, codelen), resets))
++        sources.append(src)
++        image_id += 1
++
++    lines = ["#include <stdint.h>", "",
++             "void spu_begin_image(int image_id);",
++             "void spu_overlay_register_region_at(uint32_t content_ea, uint32_t lsa, uint32_t span, int image_id);",
++             "void spu_register_stack_reset_entry(uint32_t entry, int image_id);"]
++    lines += ["void %s_spu_recomp_register(void);" % name for name, _, _, _ in regs]
++    lines += ["", "void %s_spu_register(void)" % a.name, "{"]
++    for name, iid, region, resets in regs:
++        lines.append("    spu_begin_image(%d);" % iid)
++        lines.append("    %s_spu_recomp_register();" % name)
++        if region:
++            lines.append("    spu_overlay_register_region_at(0x%08Xu, 0x%Xu, 0x%Xu, %d);" % (region[0], region[1], region[2], iid))
++        for r in resets:
++            lines.append("    spu_register_stack_reset_entry(0x%Xu, %d);" % (r, iid))
++    lines += ["    spu_begin_image(0);", "}", ""]
++    reg = os.path.join(a.out, "%s_spu_register.c" % a.name)
++    open(reg, "w").write("\n".join(lines))
++    sources.append(reg)
++    with open(os.path.join(a.out, "sources.cmake"), "w") as f:
++        f.write("set(FIRMWARE_SPU_SOURCES\n" + "".join("  [==[%s]==]\n" % os.path.abspath(s).replace("\\", "/") for s in sources) + ")\n")
++    print("wrote", reg)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/spu_program_pipeline.py b/tools/spu_program_pipeline.py
+index cfd5c221..e17d4bfd 100644
+--- a/tools/spu_program_pipeline.py
++++ b/tools/spu_program_pipeline.py
+@@ -48,6 +48,23 @@ def code_ranges(info, blob=None):
+     return ranges
+ 
+ 
++def guest_ea(buf, offset):
++    if buf[:4] != b'\x7fELF' or buf[4] != 2 or buf[5] != 2:
++        return None
++    phoff = int.from_bytes(buf[0x20:0x28], 'big')
++    phnum = int.from_bytes(buf[0x38:0x3A], 'big')
++    for i in range(phnum):
++        p = phoff + 56 * i
++        if int.from_bytes(buf[p:p + 4], 'big') != 1:
++            continue
++        off = int.from_bytes(buf[p + 8:p + 16], 'big')
++        va = int.from_bytes(buf[p + 16:p + 24], 'big')
++        filesz = int.from_bytes(buf[p + 32:p + 40], 'big')
++        if off <= offset < off + filesz:
++            return va + (offset - off)
++    return None
++
++
+ def publish(stage, destination):
+     """Replace owned output as a unit, never reuse a previous generated lift."""
+     backup = destination.with_name(destination.name + '.previous')
+@@ -105,13 +122,17 @@ def build_programs(args, registry_writer):
+             values = list(pinned_ids.values())
+             if not all(type(v) is int and 0 < v < 0x80000000 for v in values) or len(set(values)) != len(values):
+                 raise ValueError('--image-ids maps sha256 to distinct positive image ids')
++        return_entries = getattr(args, 'return_entries', False)
++        guest_regions = getattr(args, 'guest_regions', False)
+         report['provenance'] = dict(tools={str(p): sha256(p.read_bytes()) for p in tool_paths},
+                                     python=sys.version, options=dict(register_fn=args.register_fn, constructor=args.constructor,
+                                                  extra_funcs=args.extra_funcs, allow_partial=args.allow_partial,
+-                                                 handled=handled, image_ids=pinned_ids))
++                                                 handled=handled, image_ids=pinned_ids,
++                                                 return_entries=return_entries, guest_regions=guest_regions))
+         unique = {}
+         blobs = {}
+         layouts = {}
++        eas = {}
+         for path in inputs:
+             try:
+                 buf = Path(path).read_bytes()
+@@ -126,6 +147,10 @@ def build_programs(args, registry_writer):
+                     continue
+                 blob = buf[offset:offset + info['size']]
+                 digest = sha256(blob)
++                if guest_regions and digest not in eas:
++                    ea = guest_ea(buf, offset)
++                    if ea is not None:
++                        eas[digest] = ea
+                 if digest in unique:
+                     if blobs[digest] != blob:
+                         raise ValueError('SHA256 collision between distinct images')
+@@ -172,7 +197,7 @@ def build_programs(args, registry_writer):
+             if not sep or name not in {p['name'] for p in unique.values()}:
+                 raise ValueError('--extra-funcs requires discovered content name=ADDR[,ADDR...]')
+             extra[name] = [int(s.strip(), 0) for s in value.split(',')]
+-        imgs, text_fps, image_ids = [], {}, {}
++        imgs, text_fps, image_ids, regions = [], {}, {}, {}
+         from find_spu_functions import detect_functions
+         from build_spu_workloads import debase_includes
+         for digest, program in sorted(unique.items()):
+@@ -201,6 +226,8 @@ def build_programs(args, registry_writer):
+                     command += ['--extra-funcs', ','.join(hex(a) for a in extra[name])]
+                 if getattr(args, 'merge_chunks', False):
+                     command += ['--merge-chunks']
++                if return_entries:
++                    command += ['--return-entries']
+                 result = subprocess.run(command, capture_output=True, text=True)
+                 (outdir / 'lift.log').write_text(result.stdout + result.stderr)
+                 if result.returncode:
+@@ -232,6 +259,15 @@ def build_programs(args, registry_writer):
+             imgs.append((name, prefix, int(program['fingerprint'], 16), info['entry']))
+             image_ids[name] = program['image_id']
+             text_fps[name] = int(program['text_fingerprint'], 16)
++            if guest_regions:
++                if digest not in eas:
++                    report['errors'].append(name + ': --guest-regions found no guest EA for the program')
++                else:
++                    seg = info['executable'][0]
++                    lo = min(a for a, _ in program['executable_ranges'])
++                    hi = max(b for _, b in program['executable_ranges'])
++                    regions[name] = [(eas[digest] + seg['off'] + (lo - seg['addr']), lo, hi - lo)]
++                    program['guest_ea'] = hex(eas[digest])
+         # Default runtime capacity is 256 registrations, including text aliases.
+         if sum(len({fp, text_fps[name]}) for name, _, fp, _ in imgs) > 256:
+             report['errors'].append('generated registrations exceed default runtime capacity (256)')
+@@ -244,7 +280,7 @@ def build_programs(args, registry_writer):
+         if usable:
+             registry_args = type('RegistryArgs', (), dict(out=str(stage / registry.name), title='discovered SPU programs',
+                                                         register_fn=args.register_fn, constructor=args.constructor))()
+-            registry_writer(registry_args, imgs, text_fps, image_ids)
++            registry_writer(registry_args, imgs, text_fps, image_ids, regions)
+             sources = [destination / name / 'spu_recomp.c' for name, _, _, _ in imgs] + [registry]
+             # Bracket arguments preserve spaces and avoid expansion of $ in paths.
+             cmake = 'set(SPU_GENERATED_SOURCES\n' + ''.join(f'  [==[{p.as_posix()}]==]\n' for p in sources) + ')\n'
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,189 @@
+From a5e0e21f4acdb85f5dfe7dd0eeb856caf1709b49 Mon Sep 17 00:00:00 2001
+From: Redgrave961 <214504937+Redgrave961@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 00:14:32 +0200
+Subject: [PATCH] cellVideoOut: SDK device-info layout and the configured
+ display mode
+
+CellVideoOutDeviceInfo lacked the 20-byte colorInfo block, so the mode list
+was written 20 bytes early and the title read resolution 0 / aspect 0 and
+inset its picture by 18 px on each side. The struct now matches the SDK
+(colorInfo, KSV list, size checked), reports HDMI, the available state and
+the configured mode (progressive, 59.94/60 Hz); resolution availability is
+true only for the configured mode; an auto aspect resolves to 16:9. Unused
+state structs removed.
+---
+ libs/video/cellVideoOut.c | 63 ++++++++++-----------------------------
+ libs/video/cellVideoOut.h | 42 +++++++++++++-------------
+ 2 files changed, 37 insertions(+), 68 deletions(-)
+
+diff --git a/libs/video/cellVideoOut.c b/libs/video/cellVideoOut.c
+index 4ee1b7fe..d822e39a 100644
+--- a/libs/video/cellVideoOut.c
++++ b/libs/video/cellVideoOut.c
+@@ -97,7 +97,7 @@ s32 cellVideoOutConfigure(u32 videoOut, CellVideoOutConfiguration* config,
+     config = GUEST_PTR(config, CellVideoOutConfiguration*);
+     s_resolution_id = config->resolutionId;
+     s_color_format  = config->format;
+-    s_aspect        = config->aspect;
++    s_aspect        = config->aspect != CELL_VIDEO_OUT_ASPECT_AUTO ? config->aspect : CELL_VIDEO_OUT_ASPECT_16_9;
+ 
+     /* config is a guest BE struct: byte-swap multi-byte reads */
+     if (ps3_bswap32(config->pitch) > 0) {
+@@ -128,42 +128,17 @@ s32 cellVideoOutGetDeviceInfo(u32 videoOut, u32 deviceIndex,
+ 
+     info = GUEST_PTR(info, CellVideoOutDeviceInfo*);
+     memset(info, 0, sizeof(CellVideoOutDeviceInfo));
+-
+-    info->portType       = CELL_VIDEO_OUT_OUTPUT_HDMI;
+-    info->colorSpace     = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
+-    info->latency        = 0;
+-    info->state          = 2; /* connected */
++    info->portType = CELL_VIDEO_OUT_PORT_HDMI;
++    info->colorSpace = CELL_VIDEO_OUT_COLOR_SPACE_RGB;
++    info->latency = ps3_bswap16(1000);
++    info->availableModeCount = 1;
++    info->state = CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE;
+     info->rgbOutputRange = 1;
+-
+-    /* Report supported modes */
+-    int idx = 0;
+-
+-    /* 480p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_480;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    /* 576p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_576;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    /* 720p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_720;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    /* 1080p */
+-    info->availableModes[idx].resolutionId = CELL_VIDEO_OUT_RESOLUTION_1080;
+-    info->availableModes[idx].scanMode     = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
+-    info->availableModes[idx].aspect       = CELL_VIDEO_OUT_ASPECT_16_9;
+-    idx++;
+-
+-    info->availableModeCount = (u8)idx;
+-
++    info->availableModes[0].resolutionId = s_resolution_id;
++    info->availableModes[0].scanMode = CELL_VIDEO_OUT_SCAN_MODE_PROGRESSIVE;
++    info->availableModes[0].conversion = CELL_VIDEO_OUT_DISPLAY_CONVERSION_NONE;
++    info->availableModes[0].aspect = s_aspect;
++    info->availableModes[0].refreshRates = ps3_bswap16(CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ | CELL_VIDEO_OUT_REFRESH_RATE_60HZ);
+     return CELL_OK;
+ }
+ 
+@@ -177,19 +152,13 @@ s32 cellVideoOutGetNumberOfDevice(u32 videoOut)
+     return 0;
+ }
+ 
+-/* Is (resolutionId, aspect) available on this output? Return 1 (available) for
+- * the primary output. A 0 here makes the game skip its display-buffer/tile
+- * setup, leaving a null render object it later dereferences. */
+ s32 cellVideoOutGetResolutionAvailability(u32 videoOut, u32 resolutionId,
+                                           u32 aspect, u32 option)
+ {
+-    (void)aspect; (void)option;
+-    /* Stereoscopic 3D and dual-view modes have ids from 0x80 up (0x81 is 720p
+-     * frame packing). Reporting them available tells the title a 3D TV is
+-     * attached: MLB The Show 16 then asks to switch to 3D and, on yes, renders
+-     * every frame twice, stacked over-under. No host display here is one. */
+-    const s32 avail = (videoOut == CELL_VIDEO_OUT_PRIMARY && resolutionId < 0x80) ? 1 : 0;
+-    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u) -> %d\n",
+-           videoOut, resolutionId, avail);
++    (void)option;
++    const s32 avail = videoOut == CELL_VIDEO_OUT_PRIMARY && resolutionId == s_resolution_id &&
++                      (aspect == CELL_VIDEO_OUT_ASPECT_AUTO || aspect == s_aspect);
++    printf("[cellVideoOut] GetResolutionAvailability(out=%u, res=%u, aspect=%u) -> %d\n",
++           videoOut, resolutionId, aspect, avail);
+     return avail;
+ }
+diff --git a/libs/video/cellVideoOut.h b/libs/video/cellVideoOut.h
+index 7746f9cc..3170fea5 100644
+--- a/libs/video/cellVideoOut.h
++++ b/libs/video/cellVideoOut.h
+@@ -40,8 +40,11 @@ extern "C" {
+ #define CELL_VIDEO_OUT_ASPECT_4_3    1
+ #define CELL_VIDEO_OUT_ASPECT_16_9   2
+ 
+-/* Output type */
+-#define CELL_VIDEO_OUT_OUTPUT_HDMI   5
++#define CELL_VIDEO_OUT_PORT_HDMI     0x01
++#define CELL_VIDEO_OUT_DEVICE_STATE_AVAILABLE  1
++#define CELL_VIDEO_OUT_DISPLAY_CONVERSION_NONE 0
++#define CELL_VIDEO_OUT_REFRESH_RATE_59_94HZ    0x0001
++#define CELL_VIDEO_OUT_REFRESH_RATE_60HZ       0x0004
+ 
+ /* Color space */
+ #define CELL_VIDEO_OUT_COLOR_SPACE_RGB   0x01
+@@ -81,25 +84,6 @@ typedef struct CellVideoOutResolution {
+     u16 height;
+ } CellVideoOutResolution;
+ 
+-typedef struct CellVideoOutDisplayModeBytes {
+-    u8  resolutionId;
+-    u8  scanMode;
+-    u8  conversion;
+-    u8  aspect;
+-    u8  reserved[2];
+-    u16 refreshRates;   /* big-endian in guest memory */
+-} CellVideoOutDisplayModeBytes;
+-
+-typedef struct CellVideoOutState {
+-    u8  state;          /* 0=disabled, 2=enabled */
+-    u8  colorSpace;
+-    u8  reserved[6];
+-    /* SDK layout: an 8-byte CellVideoOutDisplayMode struct, NOT a u32 mode id.
+-     * Guests read displayMode.aspect (byte 11) to pick 4:3 vs 16:9; the old
+-     * u32 fed them a byte of a mode constant ("unknown aspect ratio 4"). */
+-    CellVideoOutDisplayModeBytes displayMode;
+-} CellVideoOutState;
+-
+ typedef struct CellVideoOutConfiguration {
+     u8  resolutionId;
+     u8  format;
+@@ -117,6 +101,17 @@ typedef struct CellVideoOutDisplayMode {
+     u16 refreshRates;
+ } CellVideoOutDisplayMode;
+ 
++typedef struct CellVideoOutColorInfo {
++    u16 redX, redY, greenX, greenY, blueX, blueY, whiteX, whiteY;
++    u32 gamma;
++} CellVideoOutColorInfo;
++
++typedef struct CellVideoOutKSVList {
++    u8  ksv[32 * 5];
++    u8  reserved[4];
++    u32 count;
++} CellVideoOutKSVList;
++
+ typedef struct CellVideoOutDeviceInfo {
+     u8  portType;
+     u8  colorSpace;
+@@ -125,9 +120,14 @@ typedef struct CellVideoOutDeviceInfo {
+     u8  state;
+     u8  rgbOutputRange;
+     u8  reserved[5];
++    CellVideoOutColorInfo colorInfo;
+     CellVideoOutDisplayMode availableModes[32];
++    CellVideoOutKSVList ksvList;
+ } CellVideoOutDeviceInfo;
+ 
++_Static_assert(sizeof(CellVideoOutColorInfo) == 20, "CellVideoOutColorInfo layout");
++_Static_assert(sizeof(CellVideoOutDeviceInfo) == 456, "CellVideoOutDeviceInfo layout");
++
+ /* ---------------------------------------------------------------------------
+  * Configuration
+  * -----------------------------------------------------------------------*/
+-- 
+2.54.0 (Apple Git-157)
+
